@@ -1,0 +1,24 @@
+# 日志与临时文件
+*.log
+*.pid
+
+# 本地工具与环境
+tools/
+.kimi-code/
+.opencode/
+
+# Python
+__pycache__/
+*.py[cod]
+
+# Android / Gradle
+**/build/
+**/.gradle/
+**/.kotlin/
+**/local.properties
+**/*.iml
+.idea/
+.cxx/
+*.jks
+*.keystore
+key.properties
