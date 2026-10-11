@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="utf-8"?>
+<network-security-config>
+    <!-- 校园卡易通接口为明文 HTTP（http://app.lzu.edu.cn:8080/easytong_app），
+         仅对该域名放开 cleartext；收银台回跳域名同理 -->
+    <domain-config cleartextTrafficPermitted="true">
+        <domain includeSubdomains="false">app.lzu.edu.cn</domain>
+    </domain-config>
+    <!-- 校园网深澜 Portal 为内网明文 HTTP（10.10.0.166） -->
+    <domain-config cleartextTrafficPermitted="true">
+        <domain includeSubdomains="false">10.10.0.166</domain>
+    </domain-config>
+</network-security-config>

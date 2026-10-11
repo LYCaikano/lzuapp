@@ -1,0 +1,5 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- 查寝签到拍照：TakePicture 写入应用缓存目录；仅授权 sign/ 子目录（DormScreen 拍照缓存固定在此） -->
+<paths>
+    <cache-path name="sign" path="sign/" />
+</paths>
