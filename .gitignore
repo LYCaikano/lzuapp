@@ -11,6 +11,9 @@ tools/
 __pycache__/
 *.py[cod]
 
+# 本地凭据（真实学号/密码等，仅本地使用）
+login_local.py
+
 # Android / Gradle
 **/build/
 **/.gradle/
