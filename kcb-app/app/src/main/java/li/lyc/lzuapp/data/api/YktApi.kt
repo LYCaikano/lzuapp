@@ -108,7 +108,10 @@ class YktApi(private val client: OkHttpClient = defaultClient()) {
     ): YktResponse = withContext(Dispatchers.IO) {
         val r = execute(path, params, etToken)
         if (!r.ok) {
-            val auth = r.code == 3 || r.msg.contains("未登录") || r.msg.contains("签名")
+            // 服务端把 etToken 称作 access_token：40004=无效，另有 "access_token已过期" 文案。
+            // 这些都按鉴权失败处理，由仓库层清缓存重换 etToken 后重试
+            val auth = r.code == 3 || r.code == 40004 || r.msg.contains("未登录") ||
+                r.msg.contains("签名") || r.msg.contains("access_token")
             throw YktException(r.msg.ifBlank { "操作失败" }, auth)
         }
         r
