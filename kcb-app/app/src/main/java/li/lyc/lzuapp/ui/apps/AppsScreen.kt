@@ -34,7 +34,7 @@ import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 
-/** 应用聚合页：低频功能（查寝/校园网）的卡片入口 */
+/** 应用聚合页：低频功能（评教/查寝/校园网/成绩/电费/邮箱）的卡片入口 */
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun AppsScreen(
@@ -43,6 +43,7 @@ fun AppsScreen(
     onOpenGrade: () -> Unit,
     onOpenMail: () -> Unit,
     onOpenElec: () -> Unit,
+    onOpenEval: () -> Unit,
     modifier: Modifier = Modifier,
 ) {
     Scaffold(
@@ -56,6 +57,12 @@ fun AppsScreen(
                 .verticalScroll(rememberScrollState())
                 .padding(horizontal = 16.dp, vertical = 8.dp),
         ) {
+            AppCard(
+                icon = Icons.Default.School,
+                title = "学生评教",
+                subtitle = "期中/期末评教 · 课程评价",
+                onClick = onOpenEval,
+            )
             AppCard(
                 icon = Icons.Default.Bedtime,
                 title = "查寝",

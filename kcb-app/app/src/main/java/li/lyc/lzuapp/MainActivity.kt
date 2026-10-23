@@ -85,6 +85,7 @@ class MainActivity : ComponentActivity() {
                 var showNet by remember { mutableStateOf(false) }
                 var showGrade by remember { mutableStateOf(false) }
                 var showMail by remember { mutableStateOf(false) }
+                var showEval by remember { mutableStateOf(false) }
                 var selectedTab by remember { mutableIntStateOf(0) }
                 val snackbarHostState = remember { SnackbarHostState() }
                 // 与课表页共享同一个 Activity 作用域 ViewModel（init 中触发静默更新）
@@ -141,12 +142,13 @@ class MainActivity : ComponentActivity() {
                     showYktBill = false
                     showYktRecharge = false
                 }
-                // 「应用」子页面返回（查寝/校园网/成绩/邮箱；邮箱内部层级由 MailScreen 自己的 BackHandler 优先接管）
-                BackHandler(enabled = showDorm || showNet || showGrade || showMail) {
+                // 「应用」子页面返回（查寝/校园网/成绩/邮箱/评教；邮箱与评教内部层级由各自的 BackHandler 优先接管）
+                BackHandler(enabled = showDorm || showNet || showGrade || showMail || showEval) {
                     showDorm = false
                     showNet = false
                     showGrade = false
                     showMail = false
+                    showEval = false
                 }
 
                 when {
@@ -214,6 +216,11 @@ class MainActivity : ComponentActivity() {
                             showMail -> li.lyc.lzuapp.ui.mail.MailScreen(
                                 repository = container.mailRepository,
                                 onBack = { showMail = false },
+                                modifier = Modifier.navigationBarsPadding(),
+                            )
+                            showEval -> li.lyc.lzuapp.ui.eval.EvalScreen(
+                                repository = container.evalRepository,
+                                onBack = { showEval = false },
                                 modifier = Modifier.navigationBarsPadding(),
                             )
                             showAddCourse -> {
@@ -285,6 +292,7 @@ class MainActivity : ComponentActivity() {
                                         onOpenNet = { showNet = true },
                                         onOpenGrade = { showGrade = true },
                                         onOpenMail = { showMail = true },
+                                        onOpenEval = { showEval = true },
                                         onOpenElec = {
                                             // 独立纯 View Activity（Compose 内嵌 WebView 在本机不渲染，见 ElecActivity 注释）
                                             startActivity(

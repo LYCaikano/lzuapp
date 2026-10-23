@@ -112,6 +112,8 @@ class AuthStore(private val context: Context) {
         private val KEY_THEME_COLOR = stringPreferencesKey("theme_color")
         private val KEY_ET_TOKEN = stringPreferencesKey("et_token")
         private val KEY_ET_EXPIRY = longPreferencesKey("et_expiry")
+        // 学生评教（jwqe）accessToken：无固定 TTL，靠 401/授权失效驱动刷新
+        private val KEY_JWQE_TOKEN = stringPreferencesKey("jwqe_token")
         private val KEY_YKT_ACC_NUM = stringPreferencesKey("ykt_acc_num")
         private val KEY_YKT_EPID = stringPreferencesKey("ykt_epid")
         private val KEY_YKT_CARD_ACC_NUM = stringPreferencesKey("ykt_card_acc_num")
@@ -168,6 +170,8 @@ class AuthStore(private val context: Context) {
         /** 校园卡 etToken（JWT，约 1 天有效）与到期时间 */
         val etToken: String = "",
         val etExpiry: Long = 0L,
+        /** 评教（jwqe）accessToken：无固定 TTL，失效时清缓存重新 doLogin */
+        val jwqeToken: String = "",
         /** 校园卡账户缓存：accNum / EPID / 主卡卡号 / 姓名 */
         val yktAccNum: String = "",
         val yktEpid: String = "",
@@ -219,6 +223,7 @@ class AuthStore(private val context: Context) {
             themeColor = p[KEY_THEME_COLOR] ?: "blue",
             etToken = CryptoBox.dec(p[KEY_ET_TOKEN].orEmpty()),
             etExpiry = p[KEY_ET_EXPIRY] ?: 0L,
+            jwqeToken = CryptoBox.dec(p[KEY_JWQE_TOKEN].orEmpty()),
             yktAccNum = p[KEY_YKT_ACC_NUM].orEmpty(),
             yktEpid = p[KEY_YKT_EPID].orEmpty(),
             yktCardAccNum = p[KEY_YKT_CARD_ACC_NUM].orEmpty(),
@@ -260,6 +265,16 @@ class AuthStore(private val context: Context) {
             p.remove(KEY_ET_TOKEN)
             p.remove(KEY_ET_EXPIRY)
         }
+    }
+
+    /** 保存评教（jwqe）accessToken */
+    suspend fun saveJwqeToken(token: String) {
+        context.dataStore.edit { p -> p[KEY_JWQE_TOKEN] = CryptoBox.enc(token) }
+    }
+
+    /** 清除评教 token（授权失效时强制重新 doLogin） */
+    suspend fun clearJwqeToken() {
+        context.dataStore.edit { p -> p.remove(KEY_JWQE_TOKEN) }
     }
 
     /** 记录某学号已同意用户协议（该学号后续登录免弹协议窗） */
@@ -376,7 +391,7 @@ class AuthStore(private val context: Context) {
             listOf(
                 KEY_PASSWORD, KEY_LOGIN_TOKEN, KEY_GATEWAY_TOKEN, KEY_ACCESS_TOKEN,
                 KEY_USER_NAME, KEY_COLLEGE, KEY_XYKH, KEY_ET_TOKEN, KEY_YKT_ACC_NAME,
-                KEY_NET_PASSWORD,
+                KEY_NET_PASSWORD, KEY_JWQE_TOKEN,
             ).forEach { k ->
                 val v = p[k]
                 if (!v.isNullOrEmpty() && !v.startsWith("v1:")) p[k] = CryptoBox.enc(v)
@@ -401,6 +416,7 @@ class AuthStore(private val context: Context) {
             p.remove(KEY_XYKH)
             p.remove(KEY_ET_TOKEN)
             p.remove(KEY_ET_EXPIRY)
+            p.remove(KEY_JWQE_TOKEN)
             p.remove(KEY_YKT_ACC_NUM)
             p.remove(KEY_YKT_EPID)
             p.remove(KEY_YKT_CARD_ACC_NUM)

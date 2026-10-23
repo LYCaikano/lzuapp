@@ -5,10 +5,12 @@ import android.content.Context
 import androidx.room.Room
 import li.lyc.lzuapp.data.AuthStore
 import li.lyc.lzuapp.data.api.FdmApi
+import li.lyc.lzuapp.data.api.JwqeApi
 import li.lyc.lzuapp.data.api.LzuApi
 import li.lyc.lzuapp.data.api.YktApi
 import li.lyc.lzuapp.data.db.AppDatabase
 import li.lyc.lzuapp.data.repo.CourseRepository
+import li.lyc.lzuapp.data.repo.EvalRepository
 import li.lyc.lzuapp.data.repo.FdmRepository
 import li.lyc.lzuapp.data.repo.YktRepository
 class KcbApplication : Application() {
@@ -57,6 +59,8 @@ class AppContainer(context: Context) {
     val repository: CourseRepository = CourseRepository(context, api, authStore, database)
     val yktApi: YktApi = YktApi()
     val yktRepository: YktRepository = YktRepository(authStore, api, yktApi, repository)
+    val jwqeApi: JwqeApi = JwqeApi()
+    val evalRepository: EvalRepository = EvalRepository(authStore, api, jwqeApi, repository)
     val fdmApi: FdmApi = FdmApi()
     val fdmRepository: FdmRepository = FdmRepository(authStore, api, fdmApi, repository)
     val netRepository: li.lyc.lzuapp.data.repo.NetRepository =
