@@ -1,0 +1,53 @@
+name: Release APK
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: 安装 SDK platform 36
+        run: |
+          yes | sdkmanager --licenses >/dev/null || true
+          sdkmanager "platforms;android-36" "build-tools;36.0.0"
+
+      - name: Gradle 缓存
+        uses: gradle/actions/setup-gradle@v4
+
+      # 项目未配置 ABI 分包，assembleRelease 直接产出 32/64 位通用包；
+      # 未配置签名密钥，按 build.gradle.kts 的设定沿用 debug 签名出包
+      - name: 构建 release APK
+        working-directory: kcb-app
+        run: ./gradlew assembleRelease
+
+      - name: 重命名产物
+        run: cp kcb-app/app/build/outputs/apk/release/app-release.apk "lzuapp-${GITHUB_REF_NAME}.apk"
+
+      - name: 上传构件
+        uses: actions/upload-artifact@v4
+        with:
+          name: lzuapp-${{ github.ref_name }}
+          path: lzuapp-${{ github.ref_name }}.apk
+
+      - name: 发布 Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: lzuapp-${{ github.ref_name }}.apk
+          generate_release_notes: true
