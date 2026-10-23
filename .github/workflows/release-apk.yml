@@ -20,13 +20,12 @@ jobs:
           distribution: temurin
           java-version: "17"
 
-      - name: Android SDK
-        uses: android-actions/setup-android@v3
-
+      # runner 镜像已预装 Android SDK，直接用其 sdkmanager（setup-android 动作在新镜像上已失效）
       - name: 安装 SDK platform 36
         run: |
-          yes | sdkmanager --licenses >/dev/null || true
-          sdkmanager "platforms;android-36" "build-tools;36.0.0"
+          SDKM=$(ls -d "$ANDROID_HOME"/cmdline-tools/*/bin/sdkmanager | sort -V | tail -1)
+          yes | "$SDKM" --licenses >/dev/null || true
+          "$SDKM" "platforms;android-36" "build-tools;36.0.0"
 
       - name: Gradle 缓存
         uses: gradle/actions/setup-gradle@v4
