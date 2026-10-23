@@ -30,6 +30,20 @@ jobs:
       - name: Gradle 缓存
         uses: gradle/actions/setup-gradle@v4
 
+      # settings 里的 aliyun 镜像面向国内本机开发；CI runner 上抓取不稳定，
+      # 用 init 脚本把仓库换成官方源（google/mavenCentral/pluginPortal）
+      - name: CI 专用仓库配置
+        run: |
+          mkdir -p ~/.gradle/init.d
+          cat > ~/.gradle/init.d/ci-repos.gradle <<'EOF'
+          settingsEvaluated { settings ->
+            settings.pluginManagement.repositories.clear()
+            settings.pluginManagement.repositories { google(); mavenCentral(); gradlePluginPortal() }
+            settings.dependencyResolutionManagement.repositories.clear()
+            settings.dependencyResolutionManagement.repositories { google(); mavenCentral() }
+          }
+          EOF
+
       # 项目未配置 ABI 分包，assembleRelease 直接产出 32/64 位通用包；
       # 未配置签名密钥，按 build.gradle.kts 的设定沿用 debug 签名出包
       - name: 构建 release APK
