@@ -27,7 +27,7 @@
         android:supportsRtl="true"
         android:windowSoftInputMode="adjustResize"
         android:theme="@style/Theme.Kcb">
-        <meta-data android:name="com.amap.api.v2.apikey" android:value="7700f7b6cfad866a8153b9b76d53d9fa" />
+        <meta-data android:name="com.amap.api.v2.apikey" android:value="${AMAP_API_KEY}" />
         <!-- 高德定位 SDK 要求的定位服务组件（官方文档必配） -->
         <service android:name="com.amap.api.location.APSService" />
         <!-- 校园网自动登录：短时前台服务（仅认证几秒内存活）+ Wi-Fi 事件回调接收器 -->
@@ -55,12 +55,12 @@
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
         </activity>
-        <!-- 宿舍电费：纯 View 独立 Activity（Compose 内嵌 WebView 在本机不渲染，见 ElecActivity 注释） -->
+        <!-- 宿舍电费：独立 Activity -->
         <activity
             android:name=".ui.ykt.ElecActivity"
             android:exported="false"
             android:screenOrientation="portrait" />
-        <!-- 收银台：同理独立 Activity -->
+        <!-- 收银台：独立 Activity -->
         <activity
             android:name=".ui.ykt.CashierActivity"
             android:exported="false"

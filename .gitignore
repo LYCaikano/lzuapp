@@ -6,12 +6,13 @@
 tools/
 .kimi-code/
 .opencode/
+AGENT.md
 
 # Python
 __pycache__/
 *.py[cod]
 
-# 本地凭据（真实学号/密码等，仅本地使用）
+# 本地配置
 login_local.py
 
 # Android / Gradle

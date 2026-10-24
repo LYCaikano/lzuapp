@@ -1,9 +1,18 @@
+import java.util.Properties
+
 plugins {
   alias(libs.plugins.android.application)
   alias(libs.plugins.compose.compiler)
   alias(libs.plugins.kotlin.serialization)
   alias(libs.plugins.ksp)
 }
+
+val localProps = Properties()
+val localPropsFile = rootProject.file("local.properties")
+if (localPropsFile.exists()) {
+    localPropsFile.inputStream().use(localProps::load)
+}
+val amapApiKey = localProps.getProperty("AMAP_API_KEY").orEmpty()
 
 android {
     namespace = "li.lyc.lzuapp"
@@ -14,6 +23,7 @@ android {
         targetSdk = 36
         versionCode = 9
         versionName = "0.3.1"
+        manifestPlaceholders += mapOf("AMAP_API_KEY" to amapApiKey)
     }
 
     buildTypes {
