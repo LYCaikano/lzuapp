@@ -9,9 +9,11 @@ import li.lyc.lzuapp.data.api.model.EvalQuestion
 import li.lyc.lzuapp.data.api.model.EvalSubmitAnswer
 import li.lyc.lzuapp.data.api.model.EvalSubmitItem
 import li.lyc.lzuapp.data.api.model.EvalTask
+import li.lyc.lzuapp.data.api.model.EvalTeacherQuery
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
+import kotlinx.serialization.json.JsonPrimitive
 import java.math.BigDecimal
 import java.math.RoundingMode
 import java.text.SimpleDateFormat
@@ -128,9 +130,46 @@ class EvalRepository(
     /** 评教任务列表（pjfs="排名打分" 的任务暂不支持，字段保留供 UI 提示） */
     suspend fun tasks(): EvalResult<List<EvalTask>> = withEvalRetry { jwqeApi.getTasks(it) }
 
-    /** 任务下的评教课程 */
-    suspend fun courses(taskid: Long): EvalResult<List<EvalCourse>> =
-        withEvalRetry { jwqeApi.getCourses(it, taskid.toString()) }
+    /** 按任务发布方式选择普通课程或合讲课程查询 */
+    suspend fun courses(task: EvalTask): EvalResult<List<EvalCourse>> = withEvalRetry {
+        val isJointTask = task.objecttask == "当前" && task.taskfbfs == "根据合讲教师数评价"
+        val courses = if (isJointTask) {
+            jwqeApi.getStudentEvaluation(it, task.taskid.toString()).map { course ->
+                course.copy(
+                    teachername = course.joblist.orEmpty().joinToString("、"),
+                    pjtype = "hjjskc",
+                )
+            }
+        } else {
+            jwqeApi.getCourses(it, task.taskid.toString())
+        }
+        courses.map(::normalizeCourse)
+    }
+
+    /** 合讲教师查询，保留父课程信息及教师自己的评价状态 */
+    suspend fun teachers(task: EvalTask, course: EvalCourse): EvalResult<List<EvalCourse>> = withEvalRetry {
+        val query = EvalTeacherQuery(
+            taskid = task.taskid,
+            yearterm = course.yearterm,
+            coursecode = course.coursecode,
+            page = 1,
+            limit = 50,
+            pjcoursetype = course.pjcoursetype,
+        )
+        jwqeApi.getJobnumberEvaluation(it, query).map { teacher ->
+            normalizeCourse(
+                course.copy(
+                    teachername = teacher.teachername,
+                    jobnumber = teacher.jobnumber,
+                    pjjgid = teacher.pjjgid,
+                    hassubmit = 0,
+                    pjtype = "hjjspj",
+                    speakstates = teacher.speakstates?.takeIf { it != 0 } ?: 1,
+                    joblist = null,
+                )
+            )
+        }
+    }
 
     /** 指标体系题目（indexid 传任务原始逗号串即可） */
     suspend fun questions(indexid: String, pjcoursetype: String): EvalResult<List<EvalQuestion>> =
@@ -140,45 +179,70 @@ class EvalRepository(
     suspend fun savedAnswers(pjjgid: Long): EvalResult<List<EvalAnswer>> =
         withEvalRetry { jwqeApi.getAnswers(it, pjjgid) }
 
-    /**
-     * 提交评教（每元素一门课，可一次多门）。写操作网络错误不重试，防重复提交。
-     * 条目用 [buildSubmitItem] 组装。
-     */
-    suspend fun submit(items: List<EvalSubmitItem>): EvalResult<Unit> =
-        withEvalRetry(retryOnNetwork = false) { jwqeApi.submit(it, items) }
+    /** 单个表单只调用其对应保存链；网络失败不重试，防重复提交 */
+    suspend fun submit(course: EvalCourse, item: EvalSubmitItem): EvalResult<Unit> =
+        withEvalRetry(retryOnNetwork = false) { jwqeApi.submit(it, listOf(item), course.pjtype) }
 
     companion object {
         /** 服务目录中「学生评教」的 service_info_id */
         private const val SERVICE_ID = "29562"
 
+        private fun normalizeCourse(course: EvalCourse): EvalCourse = course.copy(
+            classno = course.classno?.takeIf { it.isNotEmpty() },
+            jobnumber = course.jobnumber?.takeIf { it.isNotEmpty() },
+        )
+
         /**
-         * 组装一门课的提交条目：tevaluateResultid 新提交=0/修改=原 pjjgid；
-         * totalscore 为各题 index_score 合计（对齐官方 H5 的 toFixed(2)，0 时传 "0"）。
+         * tevaluateResultid 仅在表单 speakstates==1 或 op==dcpj 时恢复非零 pjjgid，
+         * 零按官方 pjjgid||null 归一为 null，其他情况为 0；总分只累计计分题。
+         * 对齐官方 H5：总分零为数值 0，非零为 toFixed(2) 字符串。
          */
         fun buildSubmitItem(
             course: EvalCourse,
             task: EvalTask,
+            questions: List<EvalQuestion>,
             answers: List<EvalSubmitAnswer>,
+            isDcpj: Boolean,
         ): EvalSubmitItem {
-            val total = answers.sumOf { it.index_score }
+            val scoredIds = questions.asSequence()
+                .filter { it.isscored == "是" }
+                .map { it.indexid }
+                .toSet()
+            val total = answers.asSequence()
+                .filter { it.indexid in scoredIds }
+                .fold(BigDecimal.ZERO) { sum, answer -> sum.add(BigDecimal.valueOf(answer.index_score)) }
+            val totalscore = if (total.compareTo(BigDecimal.ZERO) == 0) {
+                JsonPrimitive(0)
+            } else {
+                JsonPrimitive(total.setScale(2, RoundingMode.HALF_UP).toPlainString())
+            }
+            val tevaluateResultid: Long? = if (course.speakstates == 1 || isDcpj) {
+                course.pjjgid?.takeIf { it != 0L }
+            } else {
+                0L
+            }
             return EvalSubmitItem(
-                totalscore = if (total == 0.0) "0"
-                else BigDecimal(total).setScale(2, RoundingMode.HALF_UP).toPlainString(),
+                totalscore = totalscore,
                 classno = course.classno,
                 coursecode = course.coursecode,
                 coursename = course.coursename,
                 jobnumber = course.jobnumber,
-                tevaluateResultid = course.pjjgid ?: 0,
-                taskid = task.taskid.toString(),
+                tevaluateResultid = tevaluateResultid,
+                taskid = task.taskid,
                 studentid = course.studentid,
                 studentname = course.studentname,
                 teachername = course.teachername,
-                yearterm = course.yearterm.toString(),
+                yearterm = course.yearterm,
                 courseorgname = course.courseorgname,
                 courseorgcode = course.courseorgcode,
                 pjcoursetype = course.pjcoursetype,
                 commit_time = SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.US).format(Date()),
                 evaluateResult = answers,
+                speakstates = when (course.pjtype) {
+                    "hjjskc" -> 1
+                    "hjjspj" -> 2
+                    else -> null
+                },
             )
         }
     }

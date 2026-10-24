@@ -10,8 +10,11 @@ import li.lyc.lzuapp.data.api.model.EvalCourse
 import li.lyc.lzuapp.data.api.model.EvalQuestion
 import li.lyc.lzuapp.data.api.model.EvalSubmitItem
 import li.lyc.lzuapp.data.api.model.EvalTask
+import li.lyc.lzuapp.data.api.model.EvalTeacherQuery
+import li.lyc.lzuapp.data.api.model.EvalTeacherRecord
 import li.lyc.lzuapp.data.api.model.JwqeLoginData
 import li.lyc.lzuapp.data.api.model.JwqePage
+import li.lyc.lzuapp.data.api.model.JwqeRecordPage
 import li.lyc.lzuapp.data.api.model.JwqeResponse
 import okhttp3.FormBody
 import okhttp3.MediaType.Companion.toMediaType
@@ -27,9 +30,9 @@ import java.util.concurrent.TimeUnit
  * 接口：https://jwqe.lzu.edu.cn:8080/api，全部 POST。
  * 认证：doLogin 用 CAS ST 换 accessToken（此请求不带 Authorization）；
  *       之后业务请求带 `Authorization: Bearer <accessToken>`。
- * 响应：HTTP 200 + body code==200（个别接口 0 也算成功，宽容处理）；code!=200 时 message 为错误文案。
+ * 响应：读接口兼容 code==200/0，保存接口只接受 code==200；
  *       HTTP 401、或 message 含「授权失效」「已在其他地方登录」= 鉴权失效（可重新 doLogin 自愈）。
- * 提交类接口 body 为 JSON 数组且 URL 末尾追加 ?a=1（Content-Type: application/json）。
+ * 教师查询使用 JSON object，提交使用 JSON 数组，两者 URL 末尾均追加 ?a=1。
  */
 class JwqeApi(private val client: OkHttpClient = defaultClient()) {
 
@@ -47,7 +50,10 @@ class JwqeApi(private val client: OkHttpClient = defaultClient()) {
             msg.contains("授权失效") || msg.contains("已在其他地方登录")
     }
 
-    private val json = Json { ignoreUnknownKeys = true }
+    private val json = Json {
+        ignoreUnknownKeys = true
+        explicitNulls = true
+    }
     private val jsonMedia = "application/json".toMediaType()
 
     /** 评教业务异常；[isAuth] = 授权失效/被挤（可重新 doLogin 自愈一次） */
@@ -76,10 +82,16 @@ class JwqeApi(private val client: OkHttpClient = defaultClient()) {
         pagePost("/xspj/xspj/getXspjtask", emptyMap(), token)
     }
 
-    /** 任务下的评教课程 */
+    /** 普通任务下的评教课程 */
     suspend fun getCourses(token: String, taskid: String): List<EvalCourse> = withContext(Dispatchers.IO) {
         pagePost("/xspj/xspj/getXspjStudentCourses", mapOf("taskid" to taskid), token)
     }
+
+    /** 根据合讲教师数评价任务下的课程 */
+    suspend fun getStudentEvaluation(token: String, taskid: String): List<EvalCourse> =
+        withContext(Dispatchers.IO) {
+            pagePost("/xspj/xspj/getStudentEvaluation", mapOf("taskid" to taskid), token)
+        }
 
     /** 指标体系题目（indexid 原样传任务的逗号串即可，服务端按 pjcoursetype 匹配） */
     suspend fun getQuestions(token: String, indexid: String, pjcoursetype: String): List<EvalQuestion> =
@@ -90,19 +102,38 @@ class JwqeApi(private val client: OkHttpClient = defaultClient()) {
             )
         }
 
-    /** 已提交答案（回填已评/暂存），pjjgid 来自课程条目 */
+    /** 已提交答案（回填已评/暂存），pjjgid 来自课程或教师条目 */
     suspend fun getAnswers(token: String, pjjgid: Long): List<EvalAnswer> = withContext(Dispatchers.IO) {
         pagePost("/xspj/xspj/getevaluateResultId", mapOf("id" to pjjgid.toString()), token)
     }
 
-    /** 提交评教（JSON 数组 body + ?a=1，每元素一门课）；成功判定 code==200 */
-    suspend fun submit(token: String, items: List<EvalSubmitItem>) = withContext(Dispatchers.IO) {
-        val body = json.encodeToString(items).toRequestBody(jsonMedia)
-        val r = decode<JwqeResponse<JsonElement>>(execute("/xspj/xspj/saveStudentComment?a=1", body, token))
-        if (r.code != 200 && r.code != 0) {
-            throw JwqeException(r.message.ifBlank { "提交失败" }, isAuthMsg(r.message))
+    /** 合讲教师列表，解析 data.pageData.records */
+    suspend fun getJobnumberEvaluation(token: String, query: EvalTeacherQuery): List<EvalTeacherRecord> =
+        withContext(Dispatchers.IO) {
+            val body = json.encodeToString(query).toRequestBody(jsonMedia)
+            val r = decode<JwqeResponse<JwqeRecordPage<EvalTeacherRecord>>>(
+                execute("/xspj/xspj/getJobnumberEvaluation?a=1", body, token)
+            )
+            if (r.code != 200 && r.code != 0) {
+                throw JwqeException(r.message.ifBlank { "操作失败" }, isAuthMsg(r.message))
+            }
+            r.data?.pageData?.records.orEmpty()
         }
-    }
+
+    /** 按普通课程、合讲课程或合讲教师选择保存路径；成功只接受业务 code==200 */
+    suspend fun submit(token: String, items: List<EvalSubmitItem>, pjtype: String) =
+        withContext(Dispatchers.IO) {
+            val path = when (pjtype) {
+                "hjjskc" -> "/xspj/xspj/saveStudentEvaluationComment?a=1"
+                "hjjspj" -> "/xspj/xspj/saveStudentSpeakComment?a=1"
+                else -> "/xspj/xspj/saveStudentComment?a=1"
+            }
+            val body = json.encodeToString(items).toRequestBody(jsonMedia)
+            val r = decode<JwqeResponse<JsonElement>>(execute(path, body, token))
+            if (r.code != 200) {
+                throw JwqeException(r.message.ifBlank { "提交失败" }, isAuthMsg(r.message))
+            }
+        }
 
     // ---------- HTTP 封装 ----------
 

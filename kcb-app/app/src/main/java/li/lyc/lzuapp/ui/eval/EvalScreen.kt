@@ -24,6 +24,7 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.filled.Refresh
+import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
@@ -32,6 +33,7 @@ import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.RadioButton
 import androidx.compose.material3.Scaffold
@@ -60,12 +62,12 @@ import li.lyc.lzuapp.data.api.model.EvalQuestion
 import li.lyc.lzuapp.data.api.model.EvalTask
 import li.lyc.lzuapp.data.repo.EvalRepository
 
-/** 「已评」标签绿 */
+/** 已完成/已评标签绿 */
 private val DoneGreen = Color(0xFF43A047)
 
 /**
- * 学生评教页：任务列表 → 课程列表 → 评教表单 三级视图（单页内切换）。
- * 仅支持进行中 + 打分制任务的作答；已评课程只读回显。
+ * 学生评教页：任务 → 课程 → 合讲教师 → 表单（普通课程跳过教师列表）。
+ * 仅支持进行中 + 打分制任务；已评内容按任务规则只读或回填修改。
  */
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -79,7 +81,7 @@ fun EvalScreen(
     val context = LocalContext.current
     val snackbarHostState = remember { SnackbarHostState() }
 
-    BackHandler(enabled = state.page != EvalPage.TASKS) { vm.back() }
+    BackHandler(enabled = state.page != EvalPage.TASKS && !state.submitting) { vm.back() }
 
     LaunchedEffect(state.toast) {
         state.toast?.let { Toast.makeText(context, it, Toast.LENGTH_SHORT).show(); vm.toastShown() }
@@ -99,7 +101,7 @@ fun EvalScreen(
                         Text("学生评教")
                         val subtitle = when (state.page) {
                             EvalPage.COURSES -> state.task?.taskname
-                            EvalPage.FORM -> state.course?.coursename
+                            EvalPage.TEACHERS, EvalPage.FORM -> state.course?.coursename
                             EvalPage.TASKS -> null
                         }
                         if (!subtitle.isNullOrEmpty()) {
@@ -114,7 +116,10 @@ fun EvalScreen(
                     }
                 },
                 navigationIcon = {
-                    IconButton(onClick = { if (state.page == EvalPage.TASKS) onBack() else vm.back() }) {
+                    IconButton(
+                        onClick = { if (state.page == EvalPage.TASKS) onBack() else vm.back() },
+                        enabled = !state.submitting,
+                    ) {
                         Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "返回")
                     }
                 },
@@ -132,9 +137,26 @@ fun EvalScreen(
             when (state.page) {
                 EvalPage.TASKS -> TaskListView(state, vm)
                 EvalPage.COURSES -> CourseListView(state, vm)
+                EvalPage.TEACHERS -> TeacherListView(state, vm)
                 EvalPage.FORM -> FormView(state, vm)
             }
         }
+    }
+
+    if (state.showAutoFillConfirm) {
+        AlertDialog(
+            onDismissRequest = vm::dismissAutoFill,
+            title = { Text("覆盖当前填写？") },
+            text = {
+                Text("一键填写会覆盖当前计分题和评语；禁止全满分时会随机降档2或3道，且候选不足2道时不会填写。操作仅修改表单，不会自动提交。")
+            },
+            confirmButton = {
+                TextButton(onClick = vm::confirmAutoFill) { Text("覆盖填写") }
+            },
+            dismissButton = {
+                TextButton(onClick = vm::dismissAutoFill) { Text("取消") }
+            },
+        )
     }
 }
 
@@ -239,63 +261,153 @@ private fun CourseListView(state: EvalUiState, vm: EvalViewModel) {
         ) {
             items(state.courses) { c ->
                 val taskActive = state.task?.currentStatus == "进行中"
-                val openable = c.hassubmit == 1 || taskActive
-                CourseRow(c, openable, onClick = { vm.openCourse(c) })
+                val openable = c.isEvaluated || taskActive
+                CourseRow(
+                    c = c,
+                    openable = openable,
+                    onClick = { vm.openCourse(c) },
+                    onTeachersClick = { vm.openTeachers(c) },
+                )
             }
         }
     }
 }
 
 @Composable
-private fun CourseRow(c: EvalCourse, openable: Boolean, onClick: () -> Unit) {
+private fun CourseRow(
+    c: EvalCourse,
+    openable: Boolean,
+    onClick: () -> Unit,
+    onTeachersClick: () -> Unit,
+) {
     Card(
-        Modifier.fillMaxWidth().then(if (openable) Modifier.clickable(onClick = onClick) else Modifier),
+        Modifier.fillMaxWidth(),
+        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceContainerLow),
+    ) {
+        Column(Modifier.fillMaxWidth()) {
+            Row(
+                Modifier
+                    .fillMaxWidth()
+                    .then(if (openable) Modifier.clickable(onClick = onClick) else Modifier)
+                    .padding(14.dp),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Column(Modifier.weight(1f)) {
+                    Text(
+                        c.coursename,
+                        fontWeight = FontWeight.Medium,
+                        maxLines = 2,
+                        overflow = TextOverflow.Ellipsis,
+                    )
+                    val sub = listOfNotNull(
+                        c.teachername.takeIf { it.isNotEmpty() },
+                        c.pjcoursetype.takeIf { it.isNotEmpty() },
+                    ).joinToString(" · ")
+                    if (sub.isNotEmpty()) {
+                        Spacer(Modifier.height(4.dp))
+                        Text(
+                            sub,
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                    }
+                }
+                Spacer(Modifier.width(12.dp))
+                CourseEvaluationStatusChip(c)
+            }
+            if (c.pjtype == "hjjskc" && c.isEvaluated && !c.isComplete) {
+                Text(
+                    c.remainingTeachers?.let { "还差 $it 位教师" } ?: "教师评价进度未知",
+                    Modifier.padding(start = 14.dp, end = 14.dp, bottom = 4.dp),
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.error,
+                )
+            }
+            if (c.pjtype == "hjjskc") {
+                TextButton(
+                    onClick = onTeachersClick,
+                    enabled = openable,
+                    modifier = Modifier.align(Alignment.End).padding(end = 6.dp),
+                ) {
+                    Text("教师评价")
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun CourseEvaluationStatusChip(course: EvalCourse) {
+    val label = when {
+        !course.isEvaluated -> "未评"
+        course.isComplete -> "已完成"
+        else -> "未完成"
+    }
+    EvaluationStatusChip(course.isComplete, label)
+}
+
+@Composable
+private fun EvaluationStatusChip(done: Boolean, text: String? = null) {
+    val fg = if (done) DoneGreen else MaterialTheme.colorScheme.onSurfaceVariant
+    val bg = if (done) DoneGreen.copy(alpha = 0.15f) else MaterialTheme.colorScheme.surfaceVariant
+    Surface(color = bg, shape = RoundedCornerShape(6.dp)) {
+        Text(
+            text ?: if (done) "已评" else "未评",
+            Modifier.padding(horizontal = 8.dp, vertical = 2.dp),
+            style = MaterialTheme.typography.labelSmall,
+            color = fg,
+        )
+    }
+}
+
+// ---------- 合讲教师列表 ----------
+
+@Composable
+private fun TeacherListView(state: EvalUiState, vm: EvalViewModel) {
+    when {
+        state.loading -> LoadingBox()
+        state.error != null -> ErrorBox(state.error, vm::retry)
+        state.teachers.isEmpty() -> EmptyBox("暂无合讲教师")
+        else -> LazyColumn(
+            Modifier.fillMaxSize(),
+            contentPadding = PaddingValues(start = 16.dp, end = 16.dp, top = 8.dp, bottom = 16.dp),
+            verticalArrangement = Arrangement.spacedBy(8.dp),
+        ) {
+            item {
+                Text(
+                    "课程：${state.course?.coursename.orEmpty()}",
+                    style = MaterialTheme.typography.titleSmall,
+                    fontWeight = FontWeight.Medium,
+                )
+            }
+            items(state.teachers) { teacher ->
+                val taskActive = state.task?.currentStatus == "进行中"
+                TeacherRow(
+                    teacher = teacher,
+                    openable = teacher.isEvaluated || taskActive,
+                    onClick = { vm.openTeacher(teacher) },
+                )
+            }
+        }
+    }
+}
+
+@Composable
+private fun TeacherRow(teacher: EvalCourse, openable: Boolean, onClick: () -> Unit) {
+    Card(
+        Modifier
+            .fillMaxWidth()
+            .then(if (openable) Modifier.clickable(onClick = onClick) else Modifier),
         colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceContainerLow),
     ) {
         Row(Modifier.fillMaxWidth().padding(14.dp), verticalAlignment = Alignment.CenterVertically) {
-            Column(Modifier.weight(1f)) {
-                Text(
-                    c.coursename,
-                    fontWeight = FontWeight.Medium,
-                    maxLines = 2,
-                    overflow = TextOverflow.Ellipsis,
-                )
-                val sub = listOfNotNull(
-                    c.teachername.takeIf { it.isNotEmpty() },
-                    c.pjcoursetype.takeIf { it.isNotEmpty() },
-                ).joinToString(" · ")
-                if (sub.isNotEmpty()) {
-                    Spacer(Modifier.height(4.dp))
-                    Text(
-                        sub,
-                        style = MaterialTheme.typography.bodySmall,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant,
-                    )
-                }
-            }
+            Text(
+                teacher.teachername,
+                Modifier.weight(1f),
+                fontWeight = FontWeight.Medium,
+            )
             Spacer(Modifier.width(12.dp))
-            if (c.hassubmit == 1) {
-                Surface(color = DoneGreen.copy(alpha = 0.15f), shape = RoundedCornerShape(6.dp)) {
-                    Text(
-                        "已评",
-                        Modifier.padding(horizontal = 8.dp, vertical = 2.dp),
-                        style = MaterialTheme.typography.labelSmall,
-                        color = DoneGreen,
-                    )
-                }
-            } else {
-                Surface(
-                    color = MaterialTheme.colorScheme.surfaceVariant,
-                    shape = RoundedCornerShape(6.dp),
-                ) {
-                    Text(
-                        "未评",
-                        Modifier.padding(horizontal = 8.dp, vertical = 2.dp),
-                        style = MaterialTheme.typography.labelSmall,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant,
-                    )
-                }
-            }
+            EvaluationStatusChip(teacher.isEvaluated)
         }
     }
 }
@@ -367,6 +479,7 @@ private fun flatIndexOf(questions: List<EvalQuestion>, qid: Long): Int {
 @Composable
 private fun FormHeader(state: EvalUiState) {
     val c = state.course ?: return
+    val target = if (c.pjtype == "hjjspj") "该教师" else "该课程"
     Card(
         Modifier.fillMaxWidth(),
         colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.primaryContainer),
@@ -376,7 +489,15 @@ private fun FormHeader(state: EvalUiState) {
             if (c.teachername.isNotEmpty()) {
                 Spacer(Modifier.height(4.dp))
                 Text(
-                    "授课教师：${c.teachername}",
+                    if (c.pjtype == "hjjspj") "评价教师：${c.teachername}" else "授课教师：${c.teachername}",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
+            if (state.questions.any { it.isscored == "是" && it.type == "单选题" }) {
+                Spacer(Modifier.height(4.dp))
+                Text(
+                    "当前总分：${fmtScore(state.totalScore)}",
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
@@ -384,7 +505,14 @@ private fun FormHeader(state: EvalUiState) {
             if (state.readonly) {
                 Spacer(Modifier.height(4.dp))
                 Text(
-                    "该课程已评价，仅供查看",
+                    "${target}已评价，仅供查看",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            } else if (c.isEvaluated) {
+                Spacer(Modifier.height(4.dp))
+                Text(
+                    "${target}已评价，可修改后重新提交",
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
@@ -395,6 +523,7 @@ private fun FormHeader(state: EvalUiState) {
 
 @Composable
 private fun QuestionCard(q: EvalQuestion, state: EvalUiState, vm: EvalViewModel) {
+    val editable = !state.readonly && !state.submitting
     Card(
         Modifier.fillMaxWidth(),
         colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceContainerLow),
@@ -424,7 +553,7 @@ private fun QuestionCard(q: EvalQuestion, state: EvalUiState, vm: EvalViewModel)
                             Modifier
                                 .fillMaxWidth()
                                 .clip(RoundedCornerShape(8.dp))
-                                .clickable(enabled = !state.readonly) {
+                                .clickable(enabled = editable) {
                                     vm.setSingleAnswer(q.indexid, opt.id)
                                 }
                                 .padding(vertical = 2.dp),
@@ -433,7 +562,7 @@ private fun QuestionCard(q: EvalQuestion, state: EvalUiState, vm: EvalViewModel)
                             RadioButton(
                                 selected = selected,
                                 onClick = { vm.setSingleAnswer(q.indexid, opt.id) },
-                                enabled = !state.readonly,
+                                enabled = editable,
                             )
                             Text(opt.title, style = MaterialTheme.typography.bodyMedium)
                         }
@@ -444,7 +573,7 @@ private fun QuestionCard(q: EvalQuestion, state: EvalUiState, vm: EvalViewModel)
                     onValueChange = { vm.setTextAnswer(q.indexid, it) },
                     modifier = Modifier.fillMaxWidth(),
                     minLines = 3,
-                    enabled = !state.readonly,
+                    enabled = editable,
                     placeholder = { Text("请输入") },
                 )
                 else -> Text(
@@ -474,6 +603,43 @@ private fun SubmitBar(state: EvalUiState, vm: EvalViewModel) {
                     Text("已提交")
                 }
             } else {
+                if (state.task?.sfqxzdzgf == "是") {
+                    Text(
+                        "本任务禁止全选最高分；一键高分随机降档2或3道计分单选题，其余保持最高分，并非全满分。",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.error,
+                    )
+                    Spacer(Modifier.height(4.dp))
+                }
+                if (state.task?.sfqxzdf == "是") {
+                    Text(
+                        "本任务禁止全选最低分。",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                    Spacer(Modifier.height(8.dp))
+                }
+                OutlinedButton(
+                    onClick = vm::requestAutoFill,
+                    enabled = !state.submitting && !state.hasUnsupported,
+                    modifier = Modifier.fillMaxWidth().height(46.dp),
+                ) {
+                    Text(if (state.task?.sfqxzdzgf == "是") "一键高分" else "一键满分")
+                }
+                Text(
+                    "自动填写不会自动提交，中文评语可继续编辑",
+                    Modifier.align(Alignment.CenterHorizontally).padding(top = 4.dp, bottom = 8.dp),
+                    style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+                state.submitError?.let { submitError ->
+                    Text(
+                        submitError,
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.error,
+                    )
+                    Spacer(Modifier.height(8.dp))
+                }
                 Button(
                     onClick = vm::submit,
                     enabled = !state.submitting && !state.hasUnsupported,
