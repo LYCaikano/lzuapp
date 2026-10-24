@@ -15,7 +15,6 @@ import javax.net.ssl.X509TrustManager
 
 /**
  * 深澜自助服务平台（https://login.lzu.edu.cn:8800，Yii/PHP）客户端。
- * 逆向自 Portal.js toSelfService 与 lzunet/lzuself.py，接口文档见 ~/lzunet/README.md。
  *
  * - SSO 免验证码：GET /site/sso?data=base64("zh-CN:{用户名}:{md5(密码)}")，Set-Cookie 拿会话
  * - 在线设备：GET /home，解析在线信息表（rad_online_id / IP / 上线时间 / 产品 / user_mac）

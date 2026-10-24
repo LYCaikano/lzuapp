@@ -25,7 +25,7 @@ import okhttp3.RequestBody.Companion.toRequestBody
 import java.util.concurrent.TimeUnit
 
 /**
- * 学生评教（jwqe）API 客户端（逆向自官方 H5，2026-10）
+ * 学生评教 API 客户端。
  *
  * 接口：https://jwqe.lzu.edu.cn:8080/api，全部 POST。
  * 认证：doLogin 用 CAS ST 换 accessToken（此请求不带 Authorization）；

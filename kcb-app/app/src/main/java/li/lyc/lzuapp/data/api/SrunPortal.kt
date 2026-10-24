@@ -15,8 +15,6 @@ import javax.crypto.spec.SecretKeySpec
 
 /**
  * 兰州大学校园网深澜 Srun Portal 协议（ac_id=2，http://10.10.0.166）。
- * 逆向自 /static/themes/pro/js/Portal.js；逐行等价于 lzunet/lzunet.py，
- * 详见 ~/lzunet/README.md（接口文档与实测记录）。
  *
  * - get_challenge 取 token（60 秒有效）与 client_ip
  * - 登录：{MD5}hmac-md5 + {SRBX1}XXTEA(info) + sha1 chksum
@@ -49,7 +47,7 @@ class SrunPortal(
         fun sha1Hex(s: String): String =
             MessageDigest.getInstance("SHA-1").digest(s.toByteArray(Charsets.UTF_8)).toHex()
 
-        /** Portal.js _encodeUserInfo 的 XXTEA 变体（标准 delta，32 位掩码，长度附尾）。 */
+        /** 用户信息使用 XXTEA 变体编码（标准 delta，32 位掩码，长度附尾）。 */
         fun xxteaEncode(data: String, key: String): ByteArray {
             if (data.isEmpty()) return ByteArray(0)
             val v = strToLongs(data, true)
@@ -106,7 +104,7 @@ class SrunPortal(
             return v
         }
 
-        /** 等价于 $.base64.setAlpha(ALPHA)：标准 base64 后做字母表替换。 */
+        /** 标准 Base64 编码后替换为自定义字母表。 */
         fun b64Custom(raw: ByteArray): String {
             val sb = StringBuilder()
             var i = 0
@@ -129,7 +127,7 @@ class SrunPortal(
             return sb.toString().map { c -> if (c == '=') '=' else ALPHA[B64STD.indexOf(c)] }.joinToString("")
         }
 
-        /** 与 Python json.dumps(..., separators=(",",":"), ensure_ascii=False) 一致。 */
+        /** 转义 JSON 字符串并保留非 ASCII 字符。 */
         private fun jsonEscape(s: String): String {
             val sb = StringBuilder(s.length + 8)
             for (ch in s) {
@@ -262,7 +260,7 @@ class SrunPortal(
 
     /**
      * DM 注销（MacAuth 无感知环境必须走 rad_user_dm，unbind=1 解绑 MAC）。
-     * 用户名用裸用户名（不带域后缀），与前端 _logoutDm 一致。
+     * 用户名使用不带域后缀的裸用户名。
      */
     suspend fun logout(fallbackUsername: String): PortalResult = withContext(Dispatchers.IO) {
         val info = get("/cgi-bin/rad_user_info", emptyMap())

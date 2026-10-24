@@ -97,7 +97,7 @@ class LzuApi(private val client: OkHttpClient = defaultClient()) {
         }
 
     /**
-     * 用户信息。真实 App（StartPage.f0）为 **GET** 请求：loginToken 在 URL query，
+     * 用户信息使用 **GET** 请求：loginToken 在 URL query，
      * Transfer-Encrypt: true，响应 AES 加密。POST 会被服务端拒绝（code=0）。
      * 响应 data 可能是 JSON 字符串或对象，两种格式都兼容。
      */
@@ -141,7 +141,7 @@ class LzuApi(private val client: OkHttpClient = defaultClient()) {
             ).map { it.data.orEmpty() }
         }
 
-    /** 按服务目录 service_info_id 签 ST（官方 h0.d() 打开 H5 服务前调用，如宿舍电费 29615） */
+    /** 按服务目录 service_info_id 签 ST（如宿舍电费 29615） */
     suspend fun getStByServiceId(loginToken: String, gatewayToken: String, serviceId: String): Result<String> =
         withContext(Dispatchers.IO) {
             val query = "loginToken=" + java.net.URLEncoder.encode(loginToken, "UTF-8") +
@@ -206,9 +206,8 @@ class LzuApi(private val client: OkHttpClient = defaultClient()) {
         }
 
     /**
-     * 按周取课（官方课表 H5 周视图的数据源，2025-09 版起正式课改走这里）：
-     * GET getZdyCourse?zc=周次&qsbz=起始日。**注意：该 GET 不能带 Content-Type 头，
-     * 否则服务端一律返回 {"code":0,"失败"}**（实测，2026-08-29）。
+     * 按周取课：GET getZdyCourse?zc=周次&qsbz=起始日。
+     * 该 GET 不能带 Content-Type 头，否则服务端返回 {"code":0,"失败"}。
      * 返回该周有课的课程条目（含正式课；kcrq 为该周具体上课日期，week 为完整周次模式）。
      */
     suspend fun getWeekCourses(token: String, zc: Int, qsbz: Int = 0): Result<List<CourseData>> =
@@ -230,7 +229,7 @@ class LzuApi(private val client: OkHttpClient = defaultClient()) {
             }
         }
 
-    // ---------- 成绩查询（wdcj 命名空间，认证同课表；逆向自 lzu-web-eusp_h5_myscores） ----------
+    // ---------- 成绩查询（wdcj 命名空间，认证同课表） ----------
 
     /** 有成绩的学期列表。注意此处 xqm 语义与课表不同：1=秋季 2=春季 */
     suspend fun getStuXqList(token: String): Result<List<StuXqItem>> =

@@ -261,13 +261,10 @@ class YktRepository(
     }
 
     // ==================== 宿舍电费（校付宝 H5，服务目录 29615） ====================
-    // 官方链取证（2026-10，抓包 + jadx H5Activity.h1 + PC 复放）：
-    // 官方 App 点「宿舍电费」→ getSt(serviceId=29615) → H5Activity 打开
-    // apps_all.shtml?authAppid=…&platform=QHIT_EDU&schoolCode=10730&PersonID=<学号>&st=<ST>&ticket=<ST>
-    // （UrlType.APP：参数名 st 与 ticket 均为同一张 ST）。
-    // 校付宝会话靠 WebView Cookie 维持；首次未登录时页面自行跳统一身份认证（CAS），
-    // 登录一次后长期静默。两个缴费板块都在 apps_all 页内（本页即合并后的单页面）。
-    // 旧 easytong payEle 链（ItemNum=2）已废弃：电控系统查询恒 21s 超时返空。
+    // 入口通过 getSt(serviceId=29615) 获取一次性 ST，st 与 ticket 参数使用同一张 ST，
+    // 并携带学号打开 apps_all 页面；两个缴费板块均位于该页面。
+    // 校付宝会话由 WebView Cookie 维持，未登录时跳转统一身份认证。
+    // 获取入口时自动校验登录态；网络错误按间隔重试，登录态失效时重新登录后重签 ST。
 
     /**
      * 构造宿舍电费入口 URL（含一次性 ST）。
