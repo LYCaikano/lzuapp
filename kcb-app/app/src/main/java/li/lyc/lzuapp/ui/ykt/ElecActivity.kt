@@ -151,7 +151,7 @@ class ElecActivity : ComponentActivity() {
     }
     private val authStore by lazy { (application as KcbApplication).container.authStore }
 
-    /** 跟随 App 内主题设置（我的-深色模式），而非系统 uiMode */
+    /** 跟随 App 内主题设置（设置-深色模式），而非系统 uiMode */
     private var night: Boolean = false
 
     private var webView: WebView? = null

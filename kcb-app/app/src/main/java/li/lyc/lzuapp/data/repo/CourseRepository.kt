@@ -348,7 +348,7 @@ class CourseRepository(
         refreshAccessTokenLocked()
     }
 
-    /** 手动刷新登录状态：重新登录并补拉用户信息（我的页刷新按钮） */
+    /** 手动刷新登录状态：重新登录并补拉用户信息（设置页刷新按钮） */
     suspend fun refreshLoginState(): SyncResult {
         val s = authStore.current()
         if (s.username.isEmpty()) return SyncResult.Failed("未登录", SyncFailReason.LOGIN)

@@ -17,7 +17,7 @@ enum class ThemeMode(val storageValue: String) {
     SYSTEM("system"), LIGHT("light"), DARK("dark");
 
     companion object {
-        // 默认浅色（用户在「我的」里可改为跟随系统/深色）
+        // 默认浅色（用户在「设置」里可改为跟随系统/深色）
         fun fromStorage(value: String?): ThemeMode =
             entries.firstOrNull { it.storageValue == value } ?: LIGHT
     }

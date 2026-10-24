@@ -1277,6 +1277,12 @@ private suspend fun fetchLocation(context: Context): Location? {
  */
 @SuppressLint("MissingPermission")
 private suspend fun amapLocate(context: Context): Location? = withTimeoutOrNull(12_000) {
+    val customKey = runCatching {
+        (context.applicationContext as KcbApplication).container.authStore.current().amapApiKey
+    }.getOrDefault("")
+    val apiKey = customKey.ifEmpty {
+        context.applicationInfo.metaData?.getString("com.amap.api.v2.apikey").orEmpty()
+    }
     suspendCancellableCoroutine { cont ->
         var client: com.amap.api.location.AMapLocationClient? = null
         fun cleanup() {
@@ -1284,6 +1290,7 @@ private suspend fun amapLocate(context: Context): Location? = withTimeoutOrNull(
             runCatching { client?.onDestroy() }
         }
         try {
+            com.amap.api.location.AMapLocationClient.setApiKey(apiKey)
             val c = com.amap.api.location.AMapLocationClient(context.applicationContext)
             client = c
             c.setLocationOption(com.amap.api.location.AMapLocationClientOption().apply {

@@ -128,6 +128,7 @@ class AuthStore(private val context: Context) {
         private val KEY_NET_ACTIVE = stringPreferencesKey("net_active")
         // 用户协议：记录已同意协议的学号（永久免弹，换号重新确认）
         private val KEY_AGREEMENT_USER = stringPreferencesKey("agreement_user")
+        private val KEY_AMAP_API_KEY = stringPreferencesKey("amap_api_key")
     }
 
     /** 校园网账户（type = campus / study，见 NetRepository.AccountType.storage） */
@@ -187,6 +188,7 @@ class AuthStore(private val context: Context) {
         val netActiveId: String = "",
         /** 已同意用户协议的学号（该学号登录不再弹协议窗） */
         val agreementUser: String = "",
+        val amapApiKey: String = "",
     ) {
         val isLoggedIn: Boolean get() = loginToken.isNotEmpty() && gatewayToken.isNotEmpty()
 
@@ -238,6 +240,7 @@ class AuthStore(private val context: Context) {
             }.getOrElse { emptyList() },
             netActiveId = p[KEY_NET_ACTIVE].orEmpty(),
             agreementUser = p[KEY_AGREEMENT_USER].orEmpty(),
+            amapApiKey = CryptoBox.dec(p[KEY_AMAP_API_KEY].orEmpty()),
         )
     }.flowOn(kotlinx.coroutines.Dispatchers.Default) // 解密/映射不占用主线程
 
@@ -280,6 +283,14 @@ class AuthStore(private val context: Context) {
     /** 记录某学号已同意用户协议（该学号后续登录免弹协议窗） */
     suspend fun saveAgreementUser(username: String) {
         context.dataStore.edit { p -> p[KEY_AGREEMENT_USER] = username }
+    }
+
+    suspend fun saveAmapApiKey(value: String) {
+        val key = value.trim()
+        context.dataStore.edit { p ->
+            if (key.isEmpty()) p.remove(KEY_AMAP_API_KEY)
+            else p[KEY_AMAP_API_KEY] = CryptoBox.enc(key)
+        }
     }
 
     /** 保存校园网上网账号凭据（密码加密落盘） */
@@ -391,7 +402,7 @@ class AuthStore(private val context: Context) {
             listOf(
                 KEY_PASSWORD, KEY_LOGIN_TOKEN, KEY_GATEWAY_TOKEN, KEY_ACCESS_TOKEN,
                 KEY_USER_NAME, KEY_COLLEGE, KEY_XYKH, KEY_ET_TOKEN, KEY_YKT_ACC_NAME,
-                KEY_NET_PASSWORD, KEY_JWQE_TOKEN,
+                KEY_NET_PASSWORD, KEY_JWQE_TOKEN, KEY_AMAP_API_KEY,
             ).forEach { k ->
                 val v = p[k]
                 if (!v.isNullOrEmpty() && !v.startsWith("v1:")) p[k] = CryptoBox.enc(v)
@@ -417,6 +428,7 @@ class AuthStore(private val context: Context) {
             p.remove(KEY_ET_TOKEN)
             p.remove(KEY_ET_EXPIRY)
             p.remove(KEY_JWQE_TOKEN)
+            p.remove(KEY_AMAP_API_KEY)
             p.remove(KEY_YKT_ACC_NUM)
             p.remove(KEY_YKT_EPID)
             p.remove(KEY_YKT_CARD_ACC_NUM)

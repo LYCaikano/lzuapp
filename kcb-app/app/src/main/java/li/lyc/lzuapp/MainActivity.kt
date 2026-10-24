@@ -15,8 +15,8 @@ import androidx.compose.foundation.layout.safeDrawingPadding
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Apps
 import androidx.compose.material.icons.filled.CalendarMonth
-import androidx.compose.material.icons.filled.Person
 import androidx.compose.material.icons.filled.QrCode
+import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.Icon
 import androidx.compose.material3.NavigationBar
@@ -265,8 +265,8 @@ class MainActivity : ComponentActivity() {
                                         NavigationBarItem(
                                             selected = selectedTab == 3,
                                             onClick = { selectedTab = 3 },
-                                            icon = { Icon(Icons.Default.Person, contentDescription = "我的") },
-                                            label = { Text("我的") },
+                                            icon = { Icon(Icons.Default.Settings, contentDescription = "设置") },
+                                            label = { Text("设置") },
                                         )
                                     }
                                 },
