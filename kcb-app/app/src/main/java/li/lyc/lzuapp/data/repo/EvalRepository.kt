@@ -30,7 +30,7 @@ class EvalRepository(
     private val lzuApi: LzuApi,
     private val jwqeApi: JwqeApi,
     private val courseRepo: CourseRepository,
-) {
+) : EvalDataSource {
 
     sealed interface EvalResult<out T> {
         data class Ok<T>(val data: T) : EvalResult<T>
@@ -128,10 +128,10 @@ class EvalRepository(
     }
 
     /** 评教任务列表（pjfs="排名打分" 的任务暂不支持，字段保留供 UI 提示） */
-    suspend fun tasks(): EvalResult<List<EvalTask>> = withEvalRetry { jwqeApi.getTasks(it) }
+    override suspend fun tasks(): EvalResult<List<EvalTask>> = withEvalRetry { jwqeApi.getTasks(it) }
 
     /** 按任务发布方式选择普通课程或合讲课程查询 */
-    suspend fun courses(task: EvalTask): EvalResult<List<EvalCourse>> = withEvalRetry {
+    override suspend fun courses(task: EvalTask): EvalResult<List<EvalCourse>> = withEvalRetry {
         val isJointTask = task.objecttask == "当前" && task.taskfbfs == "根据合讲教师数评价"
         val courses = if (isJointTask) {
             jwqeApi.getStudentEvaluation(it, task.taskid.toString()).map { course ->
@@ -147,16 +147,26 @@ class EvalRepository(
     }
 
     /** 合讲教师查询，保留父课程信息及教师自己的评价状态 */
-    suspend fun teachers(task: EvalTask, course: EvalCourse): EvalResult<List<EvalCourse>> = withEvalRetry {
-        val query = EvalTeacherQuery(
-            taskid = task.taskid,
-            yearterm = course.yearterm,
-            coursecode = course.coursecode,
-            page = 1,
-            limit = 50,
-            pjcoursetype = course.pjcoursetype,
-        )
-        jwqeApi.getJobnumberEvaluation(it, query).map { teacher ->
+    override suspend fun teachers(task: EvalTask, course: EvalCourse): EvalResult<List<EvalCourse>> = withEvalRetry {
+        val records = mutableListOf<li.lyc.lzuapp.data.api.model.EvalTeacherRecord>()
+        var page = 1
+        do {
+            val query = EvalTeacherQuery(
+                taskid = task.taskid,
+                yearterm = course.yearterm,
+                coursecode = course.coursecode,
+                page = page++,
+                limit = 50,
+                pjcoursetype = course.pjcoursetype,
+            )
+            val batch = jwqeApi.getJobnumberEvaluation(it, query)
+            // Avoid looping forever if the server ignores the page parameter.
+            if (batch.isNotEmpty() && batch.all { it in records }) {
+                throw IllegalStateException("教师列表分页未更新，请稍后重试")
+            }
+            records.addAll(batch)
+        } while (batch.size == 50)
+        records.map { teacher ->
             normalizeCourse(
                 course.copy(
                     teachername = teacher.teachername,
@@ -172,15 +182,15 @@ class EvalRepository(
     }
 
     /** 指标体系题目（indexid 传任务原始逗号串即可） */
-    suspend fun questions(indexid: String, pjcoursetype: String): EvalResult<List<EvalQuestion>> =
+    override suspend fun questions(indexid: String, pjcoursetype: String): EvalResult<List<EvalQuestion>> =
         withEvalRetry { jwqeApi.getQuestions(it, indexid, pjcoursetype) }
 
     /** 已提交答案（回填已评/暂存） */
-    suspend fun savedAnswers(pjjgid: Long): EvalResult<List<EvalAnswer>> =
+    override suspend fun savedAnswers(pjjgid: Long): EvalResult<List<EvalAnswer>> =
         withEvalRetry { jwqeApi.getAnswers(it, pjjgid) }
 
     /** 单个表单只调用其对应保存链；网络失败不重试，防重复提交 */
-    suspend fun submit(course: EvalCourse, item: EvalSubmitItem): EvalResult<Unit> =
+    override suspend fun submit(course: EvalCourse, item: EvalSubmitItem): EvalResult<Unit> =
         withEvalRetry(retryOnNetwork = false) { jwqeApi.submit(it, listOf(item), course.pjtype) }
 
     companion object {

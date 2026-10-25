@@ -8,12 +8,10 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
-import kotlinx.serialization.json.JsonPrimitive
 import li.lyc.lzuapp.data.api.model.EvalCourse
-import li.lyc.lzuapp.data.api.model.EvalOption
 import li.lyc.lzuapp.data.api.model.EvalQuestion
-import li.lyc.lzuapp.data.api.model.EvalSubmitAnswer
 import li.lyc.lzuapp.data.api.model.EvalTask
+import li.lyc.lzuapp.data.repo.EvalDataSource
 import li.lyc.lzuapp.data.repo.EvalRepository
 
 /** 任务列表 → 课程列表 → 合讲教师列表 → 评教表单；普通课程跳过教师列表 */
@@ -25,7 +23,7 @@ data class EvalUiState(
     val error: String? = null,
     /** 提交校验或服务器提交失败，持续显示在当前表单底部 */
     val submitError: String? = null,
-    /** 一次性 snackbar 消息（自动填写/提交结果） */
+    /** 一次性 snackbar 消息（填写失败/提交结果） */
     val message: String? = null,
     /** 一次性 toast（任务类型不支持等轻提示） */
     val toast: String? = null,
@@ -48,6 +46,8 @@ data class EvalUiState(
     /** 校验失败后需滚动到的题目 indexid，UI 消费后清零 */
     val scrollToQuestion: Long? = null,
     val showAutoFillConfirm: Boolean = false,
+    val showBatchConfirm: Boolean = false,
+    val batch: EvalBatchState = EvalBatchState(),
 ) {
     val hasUnsupported: Boolean
         get() = questions.any { it.type != "单选题" && it.type != "问答题" }
@@ -68,16 +68,12 @@ class EvalViewModelFactory(private val repo: EvalRepository) : ViewModelProvider
     }
 }
 
-private data class DowngradeCandidate(
-    val indexid: Long,
-    val optionId: Long,
-)
-
-class EvalViewModel(private val repo: EvalRepository) : ViewModel() {
+class EvalViewModel(private val repo: EvalDataSource) : ViewModel() {
 
     private val _uiState = MutableStateFlow(EvalUiState())
     val uiState: StateFlow<EvalUiState> = _uiState.asStateFlow()
 
+    private var stopBatch = false
     private var lastActionAt = 0L
     private var coursesGeneration = 0L
     private var teachersGeneration = 0L
@@ -87,6 +83,7 @@ class EvalViewModel(private val repo: EvalRepository) : ViewModel() {
     }
 
     private fun cooldown(): Boolean {
+        if (_uiState.value.batch.running) return false
         val now = System.currentTimeMillis()
         if (now - lastActionAt < 500) return false
         lastActionAt = now
@@ -94,6 +91,7 @@ class EvalViewModel(private val repo: EvalRepository) : ViewModel() {
     }
 
     fun loadTasks() {
+        if (_uiState.value.batch.running) return
         viewModelScope.launch {
             _uiState.value = _uiState.value.copy(loading = true, error = null)
             when (val r = repo.tasks()) {
@@ -392,7 +390,7 @@ class EvalViewModel(private val repo: EvalRepository) : ViewModel() {
     /** 表单按来源退回教师或课程列表，再逐级退回任务列表 */
     fun back() {
         val s = _uiState.value
-        if (s.submitting) return
+        if (s.submitting || s.batch.running) return
         when (s.page) {
             EvalPage.FORM -> {
                 val parent = s.teacherParent
@@ -498,92 +496,8 @@ class EvalViewModel(private val repo: EvalRepository) : ViewModel() {
     }
 
     private fun autoFill() {
-        val current = _uiState.value
-        val task = current.task ?: return
-        if (current.readonly || current.submitting || current.hasUnsupported) return
-        val s = current.copy(submitError = null)
-        _uiState.value = s
-        val scored = s.questions.filter { it.isscored == "是" && it.type == "单选题" }
-        if (scored.isEmpty()) {
-            _uiState.value = s.copy(message = "当前没有可自动填写的计分单选题")
-            return
-        }
-        if (scored.any { it.optionarr.isEmpty() }) {
-            _uiState.value = s.copy(message = "部分计分单选题没有可用选项，无法自动填写")
-            return
-        }
-
-        val selected = scored.associate { q ->
-            q.indexid to requireNotNull(q.optionarr.maxByOrNull { it.score }).id
-        }.toMutableMap()
-        var downgradeCount = 0
-        if (task.sfqxzdzgf == "是") {
-            val candidates = scored.mapNotNull { q ->
-                val highest = requireNotNull(q.optionarr.maxByOrNull { it.score })
-                val second = q.optionarr.filter { it.score < highest.score }.maxByOrNull { it.score }
-                second?.let { DowngradeCandidate(q.indexid, it.id) }
-            }
-            if (candidates.size < 2) {
-                _uiState.value = s.copy(
-                    message = "可用于降档的计分单选题不足2道（当前${candidates.size}道），无法一键高分",
-                )
-                return
-            }
-            downgradeCount = if (candidates.size == 2) 2 else (2..3).random()
-            candidates.shuffled().take(downgradeCount).forEach { candidate ->
-                selected[candidate.indexid] = candidate.optionId
-            }
-        }
-        if (task.sfqxzdf == "是" && isAllMinimum(scored, selected)) {
-            _uiState.value = s.copy(
-                message = if (downgradeCount > 0) {
-                    "本次随机降档${downgradeCount}道后会触发全最低分限制，未应用自动填写，请重试或手动调整"
-                } else {
-                    "当前题目最高分与最低分相同，无法按规则一键满分"
-                },
-            )
-            return
-        }
-
-        val comments = s.questions.asSequence()
-            .filter { it.type == "问答题" }
-            .associate { it.indexid to defaultComment(it.title) }
-        _uiState.value = s.copy(
-            singleAnswers = s.singleAnswers + selected,
-            textAnswers = s.textAnswers + comments,
-            message = if (downgradeCount > 0) {
-                "已按规则填写高分：随机将${downgradeCount}道计分单选题降为次高档，其余计分题保持最高分，并非全满分。请检查后手动提交"
-            } else {
-                "已填写最高分选项和中文评语，请检查后手动提交"
-            },
-        )
+        _uiState.value = EvalFormLogic.autoFill(_uiState.value)
     }
-
-    private fun defaultComment(title: String): String {
-        val asksForSuggestion = listOf("建议", "改进", "提高", "不足", "问题", "意见").any(title::contains)
-        return if (asksForSuggestion) {
-            "无"
-        } else {
-            "教师备课充分，讲解清晰，课程内容安排合理，能够耐心解答问题，并结合实际帮助理解，我在本课程中收获很大。"
-        }
-    }
-
-    private fun selectedOption(q: EvalQuestion, answers: Map<Long, Long>): EvalOption? =
-        q.optionarr.firstOrNull { it.id == answers[q.indexid] }
-
-    private fun isAllMaximum(questions: List<EvalQuestion>, answers: Map<Long, Long>): Boolean =
-        questions.isNotEmpty() && questions.all { q ->
-            val selected = selectedOption(q, answers) ?: return@all false
-            val maximum = q.optionarr.maxOfOrNull { it.score } ?: return@all false
-            selected.score == maximum
-        }
-
-    private fun isAllMinimum(questions: List<EvalQuestion>, answers: Map<Long, Long>): Boolean =
-        questions.isNotEmpty() && questions.all { q ->
-            val selected = selectedOption(q, answers) ?: return@all false
-            val minimum = q.optionarr.minOfOrNull { it.score } ?: return@all false
-            selected.score == minimum
-        }
 
     fun submit() {
         val current = _uiState.value
@@ -592,64 +506,10 @@ class EvalViewModel(private val repo: EvalRepository) : ViewModel() {
         if (current.readonly || current.submitting) return
         val s = current.copy(submitError = null)
         _uiState.value = s
-        if (s.hasUnsupported) {
-            _uiState.value = s.copy(submitError = "包含暂不支持的题型，请前往官方 App 完成评价")
-            return
-        }
-
-        val firstMissing = s.questions.firstOrNull { q ->
-            if (q.isemptyed != "否") return@firstOrNull false
-            when (q.type) {
-                "单选题" -> selectedOption(q, s.singleAnswers) == null
-                "问答题" -> s.textAnswers[q.indexid].isNullOrBlank()
-                else -> false
-            }
-        }
-        if (firstMissing != null) {
-            _uiState.value = s.copy(
-                submitError = "还有必答题未作答，请检查带 * 的题目",
-                scrollToQuestion = firstMissing.indexid,
-            )
-            return
-        }
-
-        val scored = s.questions.filter { it.isscored == "是" && it.type == "单选题" }
-        if (task.sfqxzdzgf == "是" && isAllMaximum(scored, s.singleAnswers)) {
-            _uiState.value = s.copy(submitError = "评价不能全选最高分！")
-            return
-        }
-        if (task.sfqxzdf == "是" && isAllMinimum(scored, s.singleAnswers)) {
-            _uiState.value = s.copy(submitError = "评价不能全选最低分！")
-            return
-        }
-
-        val answers = s.questions.map { q ->
-            when (q.type) {
-                "单选题" -> {
-                    val opt = selectedOption(q, s.singleAnswers)
-                    EvalSubmitAnswer(
-                        id = s.answerIds[q.indexid] ?: 0,
-                        indexid = q.indexid,
-                        index_order = q.ordor,
-                        index_type = q.type,
-                        sfbt = q.isemptyed,
-                        index_score = opt?.score ?: 0.0,
-                        index_title = opt?.title.orEmpty(),
-                        option_id = JsonPrimitive(opt?.id?.toString().orEmpty()),
-                    )
-                }
-                else -> EvalSubmitAnswer(
-                    id = s.answerIds[q.indexid] ?: 0,
-                    indexid = q.indexid,
-                    index_order = q.ordor,
-                    index_type = q.type,
-                    sfbt = q.isemptyed,
-                    index_score = 0.0,
-                    index_title = s.textAnswers[q.indexid].orEmpty(),
-                    option_id = JsonPrimitive(0),
-                )
-            }
-        }
+        val validated = EvalFormLogic.validate(s)
+        _uiState.value = validated
+        if (validated.submitError != null) return
+        val answers = EvalFormLogic.answers(s)
         viewModelScope.launch {
             _uiState.value = _uiState.value.copy(submitting = true)
             val item = EvalRepository.buildSubmitItem(
@@ -699,6 +559,41 @@ class EvalViewModel(private val repo: EvalRepository) : ViewModel() {
                 )
             }
         }
+    }
+
+    fun requestBatch() {
+        val s = _uiState.value
+        if (s.loading || s.error != null || s.batch.running || s.submitting) return
+        if (s.page != EvalPage.TASKS && s.page != EvalPage.COURSES) return
+        if (s.page == EvalPage.TASKS && s.tasks.none { it.currentStatus == "进行中" && it.pjfs == "打分" }) return
+        if (s.page == EvalPage.COURSES && (s.task?.currentStatus != "进行中" || s.task.pjfs != "打分")) return
+        _uiState.value = s.copy(showBatchConfirm = true)
+    }
+
+    fun dismissBatch() {
+        _uiState.value = _uiState.value.copy(showBatchConfirm = false)
+    }
+
+    fun startBatch() {
+        val s = _uiState.value
+        if (!s.showBatchConfirm || s.batch.running) return
+        stopBatch = false
+        val taskId = if (s.page == EvalPage.COURSES) s.task?.taskid else null
+        _uiState.value = s.copy(showBatchConfirm = false, batch = EvalBatchState(running = true))
+        viewModelScope.launch {
+            EvalBatchRunner(repo).run(taskId, { stopBatch }) { progress ->
+                _uiState.value = _uiState.value.copy(batch = progress.copy(stopping = stopBatch && progress.running))
+            }
+            when (s.page) {
+                EvalPage.COURSES -> s.task?.let { loadCourses(it) }
+                else -> loadTasks()
+            }
+        }
+    }
+
+    fun stopBatch() {
+        stopBatch = true
+        _uiState.value = _uiState.value.copy(batch = _uiState.value.batch.copy(stopping = true))
     }
 
     fun messageShown() {
