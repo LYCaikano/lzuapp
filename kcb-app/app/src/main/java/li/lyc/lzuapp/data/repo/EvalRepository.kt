@@ -9,6 +9,7 @@ import li.lyc.lzuapp.data.api.model.EvalQuestion
 import li.lyc.lzuapp.data.api.model.EvalSubmitAnswer
 import li.lyc.lzuapp.data.api.model.EvalSubmitItem
 import li.lyc.lzuapp.data.api.model.EvalTask
+import li.lyc.lzuapp.data.api.model.EvalTeacherRecord
 import li.lyc.lzuapp.data.api.model.EvalTeacherQuery
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.sync.Mutex
@@ -148,7 +149,7 @@ class EvalRepository(
 
     /** 合讲教师查询，保留父课程信息及教师自己的评价状态 */
     override suspend fun teachers(task: EvalTask, course: EvalCourse): EvalResult<List<EvalCourse>> = withEvalRetry {
-        val records = mutableListOf<li.lyc.lzuapp.data.api.model.EvalTeacherRecord>()
+        val records = mutableListOf<EvalTeacherRecord>()
         var page = 1
         do {
             val query = EvalTeacherQuery(

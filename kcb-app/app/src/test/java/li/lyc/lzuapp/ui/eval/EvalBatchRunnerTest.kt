@@ -1,11 +1,26 @@
 package li.lyc.lzuapp.ui.eval
 
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.test.runTest
-import li.lyc.lzuapp.data.api.model.*
+import kotlinx.coroutines.test.StandardTestDispatcher
+import kotlinx.coroutines.test.setMain
+import kotlinx.coroutines.test.resetMain
+import kotlinx.coroutines.test.runCurrent
+import kotlinx.coroutines.test.advanceUntilIdle
+import li.lyc.lzuapp.data.api.model.EvalAnswer
+import li.lyc.lzuapp.data.api.model.EvalCourse
+import li.lyc.lzuapp.data.api.model.EvalOption
+import li.lyc.lzuapp.data.api.model.EvalQuestion
+import li.lyc.lzuapp.data.api.model.EvalSubmitItem
+import li.lyc.lzuapp.data.api.model.EvalTask
 import li.lyc.lzuapp.data.repo.EvalDataSource
 import li.lyc.lzuapp.data.repo.EvalRepository.EvalResult
-import org.junit.Assert.*
+import org.junit.Assert.assertEquals
+import org.junit.Assert.assertNull
+import org.junit.Assert.assertTrue
+import org.junit.Assert.fail
 import org.junit.Test
 
 class EvalBatchRunnerTest {
@@ -29,7 +44,7 @@ class EvalBatchRunnerTest {
         var onSubmit: () -> Unit = {}
         override suspend fun tasks() = EvalResult.Ok(taskList)
         override suspend fun courses(task: EvalTask) = EvalResult.Ok(courseList.map { c ->
-            if (refreshVisible && submitted.any { it.first == c }) c.copy(hassubmit = 1, pjjgid = 100) else c
+            if (refreshVisible && submitted.any { it.first == c && it.second.taskid == task.taskid }) c.copy(hassubmit = 1, pjjgid = 100) else c
         })
         override suspend fun teachers(task: EvalTask, course: EvalCourse): EvalResult<List<EvalCourse>> {
             check(course.isEvaluated) { "教师必须在课程提交并刷新后查询" }
@@ -97,6 +112,15 @@ class EvalBatchRunnerTest {
         assertEquals(listOf(2L), repo.submitted.map { it.second.taskid })
     }
 
+    @Test fun evaluatesAllActiveScoringTasksFromTaskList() = runTest {
+        val repo = Fake().apply {
+            taskList = listOf(task, task.copy(taskid = 2), task.copy(taskid = 3, currentStatus = "已结束"), task.copy(taskid = 4, pjfs = "排名打分"))
+        }
+        val result = EvalBatchRunner(repo).run(null, { false }, {})
+        assertEquals(listOf(1L, 2L), repo.submitted.map { it.second.taskid })
+        assertEquals(2, result.submitted)
+    }
+
     @Test fun failureStopsWithoutRetryingOrSubmittingNextCourse() = runTest {
         val repo = Fake().apply {
             courseList = listOf(course, course.copy(id = 2))
@@ -160,6 +184,33 @@ class EvalBatchRunnerTest {
             assertNull(state.message)
             assertTrue(state.singleAnswers.values.count { it == 2L } in 2..3)
             assertNull(EvalFormLogic.validate(state).submitError)
+        }
+    }
+
+    @OptIn(ExperimentalCoroutinesApi::class)
+    @Test fun viewModelGuardsDuplicateStartsNavigationAndRefreshWhileRunning() = runTest {
+        Dispatchers.setMain(StandardTestDispatcher(testScheduler))
+        try {
+            val repo = Fake()
+            val vm = EvalViewModel(repo)
+            advanceUntilIdle()
+            vm.requestBatch()
+            vm.startBatch()
+            vm.startBatch()
+            runCurrent()
+            assertTrue(vm.uiState.value.batch.running)
+            vm.openTask(task)
+            vm.back()
+            vm.retry()
+            assertEquals(EvalPage.TASKS, vm.uiState.value.page)
+            vm.stopBatch()
+            advanceUntilIdle()
+            assertEquals(1, repo.submitted.size)
+            assertTrue(!vm.uiState.value.batch.running)
+            assertTrue(!vm.uiState.value.loading)
+            assertTrue(vm.uiState.value.batch.result.orEmpty().startsWith("已停止"))
+        } finally {
+            Dispatchers.resetMain()
         }
     }
 
