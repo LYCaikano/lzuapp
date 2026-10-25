@@ -2,7 +2,7 @@ name: Android checks
 
 on:
   push:
-    branches: ["codex/batch-teaching-evaluation"]
+    branches: ["main"]
   pull_request:
     paths: ["kcb-app/**", ".github/workflows/android-checks.yml"]
   workflow_dispatch:
