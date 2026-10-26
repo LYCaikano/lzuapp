@@ -28,6 +28,7 @@ data class EvalBatchPlan(
     val pendingTeachers: Int,
     val protected: Int,
     val unknownTeacherCourses: Int,
+    val teachersByParent: Map<List<String>, List<EvalCourse>> = emptyMap(),
 ) {
     companion object { const val MAX_SUBMISSIONS = 20 }
 }
@@ -44,6 +45,7 @@ internal class EvalBatchRunner(private val repo: EvalDataSource) {
         var protected = 0
         var unknown = 0
         val plan = linkedMapOf<EvalTask, List<EvalCourse>>()
+        val teacherSnapshots = linkedMapOf<List<String>, List<EvalCourse>>()
         for (task in tasks) {
             val rows = repo.courses(task).valueOrThrow().uniqueTargets()
             check(plan.values.sumOf { it.size } + rows.size <= 100) { "预览超过100门课程，请进入单个任务操作" }
@@ -55,7 +57,9 @@ internal class EvalBatchRunner(private val repo: EvalDataSource) {
                 }
                 if (course.pjtype == "hjjskc" && !guarded) {
                     if (course.isEvaluated) {
-                        for (teacher in repo.teachers(task, course).valueOrThrow().uniqueTargets()) {
+                        val rows = repo.teachers(task, course).valueOrThrow().uniqueTargets()
+                        teacherSnapshots[listOf(task.taskid.toString()) + course.targetKey()] = rows
+                        for (teacher in rows) {
                             if (!teacher.isEvaluated) {
                                 if (teacher.hasDraft || repo.wasBatchAttempted(task, teacher)) protected++ else teachers++
                             }
@@ -68,7 +72,7 @@ internal class EvalBatchRunner(private val repo: EvalDataSource) {
                 }
             }
         }
-        return EvalBatchPlan(plan, courses, teachers, protected, unknown)
+        return EvalBatchPlan(plan, courses, teachers, protected, unknown, teacherSnapshots)
     }
 
     suspend fun run(
@@ -79,6 +83,10 @@ internal class EvalBatchRunner(private val repo: EvalDataSource) {
     ): EvalBatchState {
         var progress = EvalBatchState(running = true)
         val submittedTargets = mutableSetOf<List<String>>()
+        val courseCache = mutableMapOf<Long, List<EvalCourse>>()
+        val teacherCache = mutableMapOf<List<String>, List<EvalCourse>>()
+        val questionCache = mutableMapOf<Pair<String, String>, List<li.lyc.lzuapp.data.api.model.EvalQuestion>>()
+        fun parentKey(task: EvalTask, parent: EvalCourse) = listOf(task.taskid.toString()) + parent.targetKey()
         fun publish() = onProgress(progress)
         fun checkpoint() { if (shouldStop()) throw BatchStopped() }
         suspend fun guarded(task: EvalTask, course: EvalCourse): Boolean {
@@ -92,18 +100,23 @@ internal class EvalBatchRunner(private val repo: EvalDataSource) {
         }
         suspend fun fresh(task: EvalTask, target: EvalCourse, parent: EvalCourse?): EvalCourse {
             checkpoint()
-            val rows = if (parent == null) repo.courses(task) else repo.teachers(task, parent)
-            return rows.valueOrThrow().uniqueTargets().firstOrNull { it.targetKey() == target.targetKey() }
+            val rows = (if (parent == null) repo.courses(task) else repo.teachers(task, parent)).valueOrThrow().uniqueTargets()
+            if (parent == null) courseCache[task.taskid] = rows else teacherCache[parentKey(task, parent)] = rows
+            return rows.firstOrNull { it.targetKey() == target.targetKey() }
                 ?: error("当前评价对象已变化，请重新预览")
         }
         suspend fun evaluate(task: EvalTask, target: EvalCourse, parent: EvalCourse? = null) {
             checkpoint()
             progress = progress.copy(current = "${task.taskname} · ${target.coursename} · ${target.teachername}")
             publish()
-            val course = fresh(task, target, parent)
+            val cached = if (parent == null) courseCache[task.taskid] else teacherCache[parentKey(task, parent)]
+            val course = if (target.isEvaluated || target.hasDraft) target else
+                cached?.firstOrNull { it.targetKey() == target.targetKey() } ?: target
             if (guarded(task, course)) return
             if (progress.submitted >= EvalBatchPlan.MAX_SUBMISSIONS) throw BatchLimit()
-            val questions = repo.questions(task.indexid, course.pjcoursetype).valueOrThrow().sortedBy { it.ordor }
+            val questionKey = task.indexid to course.pjcoursetype
+            val questions = questionCache[questionKey] ?: repo.questions(task.indexid, course.pjcoursetype)
+                .valueOrThrow().sortedBy { it.ordor }.also { questionCache[questionKey] = it }
             check(questions.isNotEmpty()) { "没有评价题目，请手动检查" }
             check(questions.all { it.type == "单选题" || it.type == "问答题" }) { "存在不支持的题型，请手动评价" }
             val form = EvalFormLogic.autoFill(EvalUiState(task = task, course = course, questions = questions))
@@ -114,15 +127,9 @@ internal class EvalBatchRunner(private val repo: EvalDataSource) {
             val latest = fresh(task, course, parent)
             if (guarded(task, latest)) return
             checkpoint()
-            // Persist BEFORE writing. Failures/cancellation/kill cannot make an unknown write retry automatically.
-            if (!repo.markBatchAttempted(task, latest)) {
-                progress = progress.copy(protected = progress.protected + 1)
-                publish()
-                return
-            }
             repo.submit(latest, EvalRepository.buildSubmitItem(
                 latest, task, questions, EvalFormLogic.answers(form), task.sfkydcpj == "是",
-            )).valueOrThrow()
+            ), batch = true).valueOrThrow()
             submittedTargets.add(listOf(task.taskid.toString()) + latest.targetKey())
             progress = progress.copy(submitted = progress.submitted + 1)
             publish()
@@ -130,6 +137,8 @@ internal class EvalBatchRunner(private val repo: EvalDataSource) {
         publish()
         return try {
             val confirmed = plan ?: preview(taskId)
+            courseCache.putAll(confirmed.coursesByTask.mapKeys { it.key.taskid })
+            teacherCache.putAll(confirmed.teachersByParent)
             checkpoint()
             val activeTasks = repo.tasks().valueOrThrow().filter {
                 it.currentStatus == "进行中" && it.pjfs == "打分"
@@ -139,8 +148,13 @@ internal class EvalBatchRunner(private val repo: EvalDataSource) {
                 for (course in courses.uniqueTargets()) {
                     evaluate(task, course)
                     if (course.pjtype == "hjjskc") {
-                        var parent = fresh(task, course, null)
-                        if (!parent.isEvaluated && !course.hasDraft) {
+                        var parent = courseCache[task.taskid]?.firstOrNull { it.targetKey() == course.targetKey() } ?: course
+                        val justSubmitted = parentKey(task, course) in submittedTargets
+                        if (!parent.isEvaluated && !justSubmitted) continue
+                        if (justSubmitted && !parent.isEvaluated) {
+                            parent = fresh(task, course, null)
+                        }
+                        if (!parent.isEvaluated && justSubmitted) {
                             repeat(2) {
                                 if (!parent.isEvaluated) {
                                     checkpoint()
@@ -155,7 +169,8 @@ internal class EvalBatchRunner(private val repo: EvalDataSource) {
                             if (parent.hasDraft || repo.wasBatchAttempted(task, parent)) continue
                             error("课程提交后状态尚未更新，请稍后刷新再继续")
                         }
-                        val teachers = repo.teachers(task, parent).valueOrThrow().uniqueTargets()
+                        val teachers = teacherCache[parentKey(task, parent)] ?: repo.teachers(task, parent)
+                            .valueOrThrow().uniqueTargets().also { teacherCache[parentKey(task, parent)] = it }
                         check(teachers.isNotEmpty()) { "教师列表为空，请手动检查" }
                         for (teacher in teachers) evaluate(task, teacher, parent)
                     }

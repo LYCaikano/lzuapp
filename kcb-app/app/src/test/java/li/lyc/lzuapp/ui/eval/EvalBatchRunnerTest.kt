@@ -42,17 +42,22 @@ class EvalBatchRunnerTest {
         var claimAllowed = true
         var failure = false
         var cancel = false
+        var courseReads = 0
+        var teacherReads = 0
         var refreshVisible = true
         var onSubmit: () -> Unit = {}
         var onQuestions: () -> Unit = {}
         val journal = mutableSetOf<List<String>>()
         override suspend fun wasBatchAttempted(task: EvalTask, course: EvalCourse) = (listOf(task.taskid.toString()) + course.targetKey()) in journal
-        override suspend fun markBatchAttempted(task: EvalTask, course: EvalCourse) = claimAllowed && journal.add(listOf(task.taskid.toString()) + course.targetKey())
         override suspend fun tasks() = EvalResult.Ok(taskList)
-        override suspend fun courses(task: EvalTask) = EvalResult.Ok(courseList.map { c ->
+        override suspend fun courses(task: EvalTask): EvalResult<List<EvalCourse>> {
+            courseReads++
+            return EvalResult.Ok(courseList.map { c ->
             if (refreshVisible && submitted.any { it.first == c && it.second.taskid == task.taskid }) c.copy(hassubmit = 1, pjjgid = 100) else c
         })
+        }
         override suspend fun teachers(task: EvalTask, course: EvalCourse): EvalResult<List<EvalCourse>> {
+            teacherReads++
             check(course.isEvaluated) { "教师必须在课程提交并刷新后查询" }
             return EvalResult.Ok(teacherList)
         }
@@ -61,7 +66,11 @@ class EvalBatchRunnerTest {
             return EvalResult.Ok(questionList)
         }
         override suspend fun savedAnswers(pjjgid: Long) = EvalResult.Ok(saved)
-        override suspend fun submit(course: EvalCourse, item: EvalSubmitItem): EvalResult<Unit> {
+        override suspend fun submit(course: EvalCourse, item: EvalSubmitItem, batch: Boolean): EvalResult<Unit> {
+            if (!claimAllowed) return EvalResult.Err("已被其他流程认领")
+            val key = listOf(item.taskid.toString()) + course.targetKey()
+            if (batch && key in journal) return EvalResult.Err("结果待核对")
+            journal.add(key)
             if (cancel) throw CancellationException("cancelled")
             submitted.add(course to item)
             onSubmit()
@@ -226,7 +235,7 @@ class EvalBatchRunnerTest {
             courseList = listOf(parent)
             teacherList = listOf(course.copy(pjtype = "hjjspj", jobnumber = "T1"))
         }
-        repo.markBatchAttempted(task, parent)
+        repo.journal.add(listOf(task.taskid.toString()) + parent.targetKey())
         val runner = EvalBatchRunner(repo)
         val plan = runner.preview(null)
         assertEquals(1, plan.pendingTeachers)
@@ -238,7 +247,34 @@ class EvalBatchRunnerTest {
         val repo = Fake().apply { claimAllowed = false }
         val result = EvalBatchRunner(repo).run(null, { false }, {})
         assertTrue(repo.submitted.isEmpty())
-        assertEquals(1, result.protected)
+        assertTrue(result.result.orEmpty().contains("已被其他流程认领"))
+    }
+
+    @Test fun hundredCoursesWithOnePendingNeedOnlyOneRefreshBeforeWrite() = runTest {
+        val repo = Fake().apply {
+            courseList = (1L..100L).map { course.copy(id = it, coursecode = "C$it", hassubmit = if (it == 100L) 0 else 1) }
+        }
+        val runner = EvalBatchRunner(repo)
+        val plan = runner.preview(null)
+        runner.run(null, { false }, {}, plan)
+        assertEquals(1, repo.submitted.size)
+        assertEquals(2, repo.courseReads) // One preview + one write-time refresh, independent of skipped count.
+    }
+
+    @Test fun hundredTeachersWithOnePendingReusePreviewAndRefreshOnlyBeforeWrite() = runTest {
+        val repo = Fake().apply {
+            courseList = listOf(course.copy(pjtype = "hjjskc", hassubmit = 1, pjjgid = 10))
+            teacherList = (1L..100L).map { course.copy(
+                pjtype = "hjjspj", jobnumber = "T$it", pjjgid = if (it == 100L) null else it,
+                speakstates = if (it == 100L) 1 else 2,
+            ) }
+        }
+        val runner = EvalBatchRunner(repo)
+        val plan = runner.preview(null)
+        runner.run(null, { false }, {}, plan)
+        assertEquals(1, repo.submitted.size)
+        assertEquals(2, repo.teacherReads)
+        assertEquals(1, repo.courseReads)
     }
 
     @Test fun coroutineCancellationPropagates() = runTest {

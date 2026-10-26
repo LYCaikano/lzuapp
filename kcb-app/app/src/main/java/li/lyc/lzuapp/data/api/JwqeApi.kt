@@ -40,6 +40,7 @@ import java.util.concurrent.TimeUnit
 class JwqeApi(
     private val client: OkHttpClient = defaultClient(),
     private val gate: EvalRequestGate = EvalRequestGate(),
+    private val baseUrl: String = BASE,
 ) {
 
     companion object {
@@ -130,7 +131,7 @@ class JwqeApi(
         }
 
     /** 按普通课程、合讲课程或合讲教师选择保存路径；成功只接受业务 code==200 */
-    suspend fun submit(token: String, items: List<EvalSubmitItem>, pjtype: String) =
+    suspend fun submit(token: String, items: List<EvalSubmitItem>, pjtype: String, beforeSend: () -> Unit = {}) =
         withContext(Dispatchers.IO) {
             val path = when (pjtype) {
                 "hjjskc" -> "/xspj/xspj/saveStudentEvaluationComment?a=1"
@@ -138,7 +139,7 @@ class JwqeApi(
                 else -> "/xspj/xspj/saveStudentComment?a=1"
             }
             val body = json.encodeToString(items).toRequestBody(jsonMedia)
-            val r = decode<JwqeResponse<JsonElement>>(execute(path, body, token))
+            val r = decode<JwqeResponse<JsonElement>>(execute(path, body, token, beforeSend))
             if (r.code != 200) {
                 throw JwqeException(r.message.ifBlank { "提交失败" }, isAuthMsg(r.message))
             }
@@ -157,18 +158,30 @@ class JwqeApi(
     }
 
     /** 实际执行请求；HTTP 401 按鉴权失效抛出 */
-    private suspend fun execute(path: String, body: RequestBody, token: String?): String =
+    private suspend fun execute(path: String, body: RequestBody, token: String?, beforeSend: (() -> Unit)? = null): String =
         gate.request(write = path.contains("/save")) {
-            val request = Request.Builder().url(BASE + path).post(body).apply {
+            val request = Request.Builder().url(baseUrl + path).post(body).apply {
                 if (!token.isNullOrEmpty()) header("Authorization", "Bearer $token")
             }.build()
-            client.newCall(request).execute().use { resp ->
+            val transport = if (beforeSend == null) client else client.newBuilder()
+                .addNetworkInterceptor { chain ->
+                    // Runs after gate/auth/DNS/connect/TLS, immediately before HTTP request headers.
+                    beforeSend()
+                    chain.proceed(chain.request())
+                }.build()
+            transport.newCall(request).execute().use { resp ->
                 val text = resp.body?.string().orEmpty()
-                val businessCode = if (resp.isSuccessful) runCatching {
-                    json.parseToJsonElement(text).jsonObject["code"]?.jsonPrimitive?.intOrNull
-                }.getOrNull() else null
-                val limitCode = if (resp.code == 429 || resp.code == 403) resp.code else businessCode
-                if (limitCode == 429 || limitCode == 403) {
+                val envelope = runCatching { json.parseToJsonElement(text).jsonObject }.getOrNull()
+                val businessCode = envelope?.get("code")?.let { runCatching { it.jsonPrimitive.intOrNull }.getOrNull() }
+                val messages = listOf("message", "msg", "error", "error_description").mapNotNull { name ->
+                    envelope?.get(name)?.let { runCatching { it.jsonPrimitive.content }.getOrNull() }
+                }.joinToString(" ")
+                // Inspect status fields, not arbitrary data (which can contain user evaluation text).
+                val frequent = listOf("操作频繁", "请求频繁", "访问频繁", "请稍后再试", "请稍后重试", "请求过于频繁", "操作过于频繁", "访问过于频繁", "系统繁忙", "服务繁忙", "too many requests", "rate limit", "too frequent", "try again later")
+                    .any { messages.contains(it, ignoreCase = true) } ||
+                    (envelope == null && listOf("操作频繁", "请求频繁", "请稍后再试", "too many requests").any { text.contains(it, ignoreCase = true) })
+                val limitCode = if (resp.code == 429 || resp.code == 403 || resp.code == 503) resp.code else businessCode
+                if (limitCode == 429 || limitCode == 403 || limitCode == 503 || frequent) {
                     val now = System.currentTimeMillis()
                     val retry = resp.header("Retry-After")
                     val seconds = retry?.toLongOrNull()?.coerceAtLeast(0)

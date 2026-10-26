@@ -75,4 +75,25 @@ class EvalRequestGateTest {
         try { JwqeApi(client, EvalRequestGate(store)).getTasks("fake") } catch (_: EvalRateLimitedException) { }
         assertTrue(store.state.blockedUntil >= before + 300_000)
     }
+    @Test fun businessFrequencyMessagesCannotBeTreatedAsSuccessEvenWithCode200() = runTest {
+        for (body in listOf(
+            """{"code":200,"message":"操作频繁，请稍后再试","data":{"pageData":[]}}""",
+            """{"code":9001,"msg":"请求频繁"}""",
+            """{"code":0,"error":"too many requests"}""",
+            """{"code":503,"message":"busy"}""",
+        )) {
+            val store = Store()
+            val client = OkHttpClient.Builder().addInterceptor { chain ->
+                Response.Builder().request(chain.request()).protocol(Protocol.HTTP_1_1)
+                    .code(200).message("OK").body(body.toResponseBody()).build()
+            }.build()
+            val before = System.currentTimeMillis()
+            try {
+                JwqeApi(client, EvalRequestGate(store)).getTasks("fake")
+                fail("Business throttle must not return success")
+            } catch (_: EvalRateLimitedException) { }
+            assertTrue(store.state.blockedUntil >= before + 60_000)
+        }
+    }
+
 }

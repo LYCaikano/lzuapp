@@ -187,14 +187,27 @@ class EvalRepository(
             safety.attempted(authStore.current().username, task.taskid, course)
         }
 
-    override suspend fun markBatchAttempted(task: EvalTask, course: EvalCourse): Boolean =
+    /** Manual and batch submissions share the same preflight/transport journal. */
+    override suspend fun submit(course: EvalCourse, item: EvalSubmitItem, batch: Boolean): EvalResult<Unit> =
         kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
-            safety.markAttempted(authStore.current().username, task.taskid, course)
+            try {
+                val key = safety.submissionKey(authStore.current().username, item.taskid, course)
+                safety.journal.submit(key, repeatConfirmed = !batch) { beforeSend ->
+                    // Convert Err to an exception inside the journal so preflight failures release claims.
+                    when (val result = withEvalRetry(retryOnNetwork = false) {
+                        jwqeApi.submit(it, listOf(item), course.pjtype, beforeSend)
+                    }) {
+                        is EvalResult.Ok -> Unit
+                        is EvalResult.Err -> throw IllegalStateException(result.message)
+                    }
+                }
+                EvalResult.Ok(Unit)
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                EvalResult.Err(e.message ?: "提交失败")
+            }
         }
-
-    /** 单个表单只调用其对应保存链；网络失败不重试，防重复提交 */
-    override suspend fun submit(course: EvalCourse, item: EvalSubmitItem): EvalResult<Unit> =
-        withEvalRetry(retryOnNetwork = false) { jwqeApi.submit(it, listOf(item), course.pjtype) }
 
     companion object {
         /** 服务目录中「学生评教」的 service_info_id */

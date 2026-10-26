@@ -26,12 +26,29 @@ class EvalSafetyStore(context: Context) : EvalRequestGate.Store {
         check(prefs.edit().putLong("read_at", state.readAt).putLong("write_at", state.writeAt)
             .putLong("blocked_until", state.blockedUntil).commit()) { "无法保存评教限速状态，已停止请求" }
     }
-    fun attempted(account: String, taskId: Long, course: EvalCourse): Boolean = prefs.getBoolean(key(account, taskId, course), false)
-    fun markAttempted(account: String, taskId: Long, course: EvalCourse): Boolean = synchronized(this) {
-        if (attempted(account, taskId, course)) return@synchronized false
-        check(prefs.edit().putBoolean(key(account, taskId, course), true).commit()) { "无法保存提交记录，已停止提交" }
-        true
-    }
+    internal val journal = EvalSubmissionJournal(object : EvalSubmissionJournal.Store {
+        override fun read(key: String): EvalSubmissionJournal.Phase? = when (prefs.all[key]) {
+            true, "SENT" -> EvalSubmissionJournal.Phase.SENT // Conservative migration of old boolean markers.
+            "CONFIRMED" -> EvalSubmissionJournal.Phase.CONFIRMED
+            else -> null
+        }
+        override fun write(key: String, phase: EvalSubmissionJournal.Phase) {
+            val prior = prefs.all[key]
+            if (!prefs.edit().putString(key, phase.name).commit()) {
+                // SharedPreferences updates its memory cache even when commit() fails.
+                val rollback = prefs.edit()
+                when (prior) {
+                    is Boolean -> rollback.putBoolean(key, prior)
+                    is String -> rollback.putString(key, prior)
+                    else -> rollback.remove(key)
+                }
+                rollback.commit()
+                error("无法保存提交记录，已停止发送请求")
+            }
+        }
+    })
+    fun attempted(account: String, taskId: Long, course: EvalCourse): Boolean = journal.protected(key(account, taskId, course))
+    internal fun submissionKey(account: String, taskId: Long, course: EvalCourse): String = key(account, taskId, course)
     private fun key(account: String, taskId: Long, course: EvalCourse): String {
         val parts = listOf(account, taskId.toString()) + course.targetKey()
         val bytes = parts.joinToString("") { "${it.length}:$it" }.toByteArray(Charsets.UTF_8)

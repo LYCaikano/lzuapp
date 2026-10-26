@@ -15,6 +15,5 @@ interface EvalDataSource {
     suspend fun questions(indexid: String, pjcoursetype: String): EvalResult<List<EvalQuestion>>
     suspend fun savedAnswers(pjjgid: Long): EvalResult<List<EvalAnswer>>
     suspend fun wasBatchAttempted(task: EvalTask, course: EvalCourse): Boolean
-    suspend fun markBatchAttempted(task: EvalTask, course: EvalCourse): Boolean
-    suspend fun submit(course: EvalCourse, item: EvalSubmitItem): EvalResult<Unit>
+    suspend fun submit(course: EvalCourse, item: EvalSubmitItem, batch: Boolean = false): EvalResult<Unit>
 }
