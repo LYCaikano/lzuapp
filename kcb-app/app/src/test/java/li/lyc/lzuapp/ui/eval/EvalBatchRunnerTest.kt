@@ -15,6 +15,7 @@ import li.lyc.lzuapp.data.api.model.EvalOption
 import li.lyc.lzuapp.data.api.model.EvalQuestion
 import li.lyc.lzuapp.data.api.model.EvalSubmitItem
 import li.lyc.lzuapp.data.api.model.EvalTask
+import li.lyc.lzuapp.data.repo.targetKey
 import li.lyc.lzuapp.data.repo.EvalDataSource
 import li.lyc.lzuapp.data.repo.EvalRepository.EvalResult
 import org.junit.Assert.assertEquals
@@ -38,10 +39,15 @@ class EvalBatchRunnerTest {
         var questionList = listOf(question)
         var saved = emptyList<EvalAnswer>()
         var submitted = mutableListOf<Pair<EvalCourse, EvalSubmitItem>>()
+        var claimAllowed = true
         var failure = false
         var cancel = false
         var refreshVisible = true
         var onSubmit: () -> Unit = {}
+        var onQuestions: () -> Unit = {}
+        val journal = mutableSetOf<List<String>>()
+        override suspend fun wasBatchAttempted(task: EvalTask, course: EvalCourse) = (listOf(task.taskid.toString()) + course.targetKey()) in journal
+        override suspend fun markBatchAttempted(task: EvalTask, course: EvalCourse) = claimAllowed && journal.add(listOf(task.taskid.toString()) + course.targetKey())
         override suspend fun tasks() = EvalResult.Ok(taskList)
         override suspend fun courses(task: EvalTask) = EvalResult.Ok(courseList.map { c ->
             if (refreshVisible && submitted.any { it.first == c && it.second.taskid == task.taskid }) c.copy(hassubmit = 1, pjjgid = 100) else c
@@ -50,7 +56,10 @@ class EvalBatchRunnerTest {
             check(course.isEvaluated) { "教师必须在课程提交并刷新后查询" }
             return EvalResult.Ok(teacherList)
         }
-        override suspend fun questions(indexid: String, pjcoursetype: String) = EvalResult.Ok(questionList)
+        override suspend fun questions(indexid: String, pjcoursetype: String): EvalResult<List<EvalQuestion>> {
+            onQuestions()
+            return EvalResult.Ok(questionList)
+        }
         override suspend fun savedAnswers(pjjgid: Long) = EvalResult.Ok(saved)
         override suspend fun submit(course: EvalCourse, item: EvalSubmitItem): EvalResult<Unit> {
             if (cancel) throw CancellationException("cancelled")
@@ -61,7 +70,7 @@ class EvalBatchRunnerTest {
     }
 
     @Test fun submitsOrdinaryCourseAndSkipsAlreadyEvaluated() = runTest {
-        val repo = Fake().apply { courseList = listOf(course, course.copy(id = 2, hassubmit = 1)) }
+        val repo = Fake().apply { courseList = listOf(course, course.copy(id = 2, coursecode = "B", hassubmit = 1)) }
         val result = EvalBatchRunner(repo).run(null, { false }, {})
         assertEquals(1, result.submitted)
         assertEquals(1, result.skipped)
@@ -123,7 +132,7 @@ class EvalBatchRunnerTest {
 
     @Test fun failureStopsWithoutRetryingOrSubmittingNextCourse() = runTest {
         val repo = Fake().apply {
-            courseList = listOf(course, course.copy(id = 2))
+            courseList = listOf(course, course.copy(id = 2, coursecode = "B"))
             failure = true
         }
         val result = EvalBatchRunner(repo).run(null, { false }, {})
@@ -135,7 +144,7 @@ class EvalBatchRunnerTest {
     @Test fun stopFinishesCurrentSubmissionAndDoesNotStartAnother() = runTest {
         var stop = false
         val repo = Fake().apply {
-            courseList = listOf(course, course.copy(id = 2))
+            courseList = listOf(course, course.copy(id = 2, coursecode = "B"))
             onSubmit = { stop = true }
         }
         val result = EvalBatchRunner(repo).run(null, { stop }, {})
@@ -153,16 +162,83 @@ class EvalBatchRunnerTest {
         }
     }
 
-    @Test fun draftAnswerIdsAndRequiredNonScoredAnswersArePreserved() = runTest {
+    @Test fun draftsAreProtectedWithoutLoadingOrOverwritingAnswers() = runTest {
         val repo = Fake().apply {
             courseList = listOf(course.copy(pjjgid = 100, hassubmit = 2))
-            questionList = listOf(question, question.copy(indexid = 2, isscored = "否"))
-            saved = listOf(EvalAnswer(id = 40, indexid = 1, option_id = 2), EvalAnswer(id = 41, indexid = 2, option_id = 2))
+            onQuestions = { error("Draft must not be opened for autofill") }
         }
+        val plan = EvalBatchRunner(repo).preview(null)
+        assertEquals(1, plan.protected)
+        val result = EvalBatchRunner(repo).run(null, { false }, {}, plan)
+        assertEquals(1, result.protected)
+        assertTrue(repo.submitted.isEmpty())
+    }
+
+    @Test fun duplicateTasksAndRowsSubmitOnlyOnceEvenWhenServerStaysStale() = runTest {
+        val repo = Fake().apply {
+            taskList = listOf(task, task)
+            courseList = listOf(course, course.copy(id = 999))
+            refreshVisible = false
+        }
+        val result = EvalBatchRunner(repo).run(null, { false }, {})
+        assertEquals(1, result.submitted)
         EvalBatchRunner(repo).run(null, { false }, {})
-        val answers = repo.submitted.single().second.evaluateResult
-        assertEquals(listOf(40L, 41L), answers.map { it.id })
-        assertEquals("2", answers[1].option_id.toString().trim('"'))
+        assertEquals(1, repo.submitted.size)
+    }
+
+    @Test fun newDraftOrEvaluationDuringFormLoadingWinsOverOldSnapshot() = runTest {
+        for (newState in listOf(course.copy(hassubmit = 1), course.copy(hassubmit = 2, pjjgid = 100))) {
+            val repo = Fake().apply { onQuestions = { courseList = listOf(newState) } }
+            EvalBatchRunner(repo).run(null, { false }, {})
+            assertTrue(repo.submitted.isEmpty())
+        }
+    }
+
+    @Test fun previewDoesNotSubmitAndRunStopsAtTwentyWrites() = runTest {
+        val repo = Fake().apply { courseList = (1L..25L).map { course.copy(id = it, coursecode = "C$it") } }
+        val runner = EvalBatchRunner(repo)
+        val plan = runner.preview(null)
+        assertEquals(25, plan.pendingCourses)
+        assertTrue(repo.submitted.isEmpty())
+        val result = runner.run(null, { false }, {}, plan)
+        assertEquals(20, repo.submitted.size)
+        assertTrue(result.result.orEmpty().contains("20项上限"))
+    }
+
+    @Test fun unknownFailedWriteStaysProtectedOnNextRun() = runTest {
+        val repo = Fake().apply { failure = true; refreshVisible = false }
+        EvalBatchRunner(repo).run(null, { false }, {})
+        repo.failure = false
+        val result = EvalBatchRunner(repo).run(null, { false }, {})
+        assertEquals(1, repo.submitted.size)
+        assertEquals(1, result.protected)
+    }
+
+    @Test fun duplicatePendingAndDraftRowsAlwaysProtectDraft() = runTest {
+        val repo = Fake().apply { courseList = listOf(course, course.copy(id = 999, hassubmit = 2, pjjgid = 10)) }
+        EvalBatchRunner(repo).run(null, { false }, {})
+        assertTrue(repo.submitted.isEmpty())
+    }
+
+    @Test fun submittedParentJournalDoesNotHideItsPendingTeachersOnNextPreview() = runTest {
+        val parent = course.copy(pjtype = "hjjskc", hassubmit = 1, pjjgid = 10)
+        val repo = Fake().apply {
+            courseList = listOf(parent)
+            teacherList = listOf(course.copy(pjtype = "hjjspj", jobnumber = "T1"))
+        }
+        repo.markBatchAttempted(task, parent)
+        val runner = EvalBatchRunner(repo)
+        val plan = runner.preview(null)
+        assertEquals(1, plan.pendingTeachers)
+        runner.run(null, { false }, {}, plan)
+        assertEquals("hjjspj", repo.submitted.single().first.pjtype)
+    }
+
+    @Test fun failedAtomicClaimProtectsTargetEvenWhenEarlierReadsWerePending() = runTest {
+        val repo = Fake().apply { claimAllowed = false }
+        val result = EvalBatchRunner(repo).run(null, { false }, {})
+        assertTrue(repo.submitted.isEmpty())
+        assertEquals(1, result.protected)
     }
 
     @Test fun coroutineCancellationPropagates() = runTest {
@@ -195,15 +271,19 @@ class EvalBatchRunnerTest {
             val vm = EvalViewModel(repo)
             advanceUntilIdle()
             vm.requestBatch()
+            advanceUntilIdle()
+            repo.onSubmit = {
+                assertTrue(vm.uiState.value.blocksBack)
+                vm.openTask(task)
+                vm.back()
+                vm.retry()
+                vm.startBatch()
+                vm.stopBatch()
+            }
             vm.startBatch()
             vm.startBatch()
             runCurrent()
-            assertTrue(vm.uiState.value.batch.running)
-            vm.openTask(task)
-            vm.back()
-            vm.retry()
             assertEquals(EvalPage.TASKS, vm.uiState.value.page)
-            vm.stopBatch()
             advanceUntilIdle()
             assertEquals(1, repo.submitted.size)
             assertTrue(!vm.uiState.value.batch.running)
@@ -212,6 +292,12 @@ class EvalBatchRunnerTest {
         } finally {
             Dispatchers.resetMain()
         }
+    }
+
+    @Test fun singleSubmissionConsumesBackInsteadOfLettingHostExit() {
+        assertTrue(EvalUiState(page = EvalPage.FORM, submitting = true).blocksBack)
+        assertTrue(EvalUiState(page = EvalPage.TASKS, batchPreparing = true).blocksBack)
+        assertTrue(!EvalUiState(page = EvalPage.FORM).blocksBack)
     }
 
     @Test fun insufficientDowngradeCandidatesLeaveFormUnchangedAndExplainFailure() {

@@ -31,6 +31,7 @@ class EvalRepository(
     private val lzuApi: LzuApi,
     private val jwqeApi: JwqeApi,
     private val courseRepo: CourseRepository,
+    private val safety: EvalSafetyStore,
 ) : EvalDataSource {
 
     sealed interface EvalResult<out T> {
@@ -49,7 +50,7 @@ class EvalRepository(
         val s = authStore.current()
         if (s.jwqeToken.isNotEmpty()) return@withLock Result.success(s.jwqeToken)
         val first = loginLocked()
-        if (first.isSuccess) return@withLock first
+        if (first.isSuccess || first.exceptionOrNull() is li.lyc.lzuapp.data.api.EvalRateLimitedException) return@withLock first
         // 首次失败：静默重新登录后重试一次
         val relogin = courseRepo.login(s.username, s.password)
         if (relogin !is LoginResult.Success) {
@@ -77,7 +78,7 @@ class EvalRepository(
         } catch (e: CancellationException) {
             throw e
         } catch (e: Exception) {
-            Result.failure(if (e is java.io.IOException) e else Exception(e.message ?: "评教登录失败"))
+            Result.failure(e)
         }
     }
 
@@ -149,25 +150,16 @@ class EvalRepository(
 
     /** 合讲教师查询，保留父课程信息及教师自己的评价状态 */
     override suspend fun teachers(task: EvalTask, course: EvalCourse): EvalResult<List<EvalCourse>> = withEvalRetry {
-        val records = mutableListOf<EvalTeacherRecord>()
+        val records = linkedMapOf<Pair<String?, String>, EvalTeacherRecord>()
         var page = 1
         do {
-            val query = EvalTeacherQuery(
-                taskid = task.taskid,
-                yearterm = course.yearterm,
-                coursecode = course.coursecode,
-                page = page++,
-                limit = 50,
-                pjcoursetype = course.pjcoursetype,
-            )
+            check(page <= 20) { "教师分页超过20页，请手动检查" }
+            val query = EvalTeacherQuery(task.taskid, course.yearterm, course.coursecode, page++, 50, course.pjcoursetype)
             val batch = jwqeApi.getJobnumberEvaluation(it, query)
-            // Avoid looping forever if the server ignores the page parameter.
-            if (batch.isNotEmpty() && batch.all { it in records }) {
-                throw IllegalStateException("教师列表分页未更新，请稍后重试")
-            }
-            records.addAll(batch)
+            val added = mergeTeacherPage(records, batch)
+            check(batch.isEmpty() || added > 0 || batch.size < 50) { "教师列表分页未更新，请稍后重试" }
         } while (batch.size == 50)
-        records.map { teacher ->
+        records.values.map { teacher ->
             normalizeCourse(
                 course.copy(
                     teachername = teacher.teachername,
@@ -189,6 +181,16 @@ class EvalRepository(
     /** 已提交答案（回填已评/暂存） */
     override suspend fun savedAnswers(pjjgid: Long): EvalResult<List<EvalAnswer>> =
         withEvalRetry { jwqeApi.getAnswers(it, pjjgid) }
+
+    override suspend fun wasBatchAttempted(task: EvalTask, course: EvalCourse): Boolean =
+        kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
+            safety.attempted(authStore.current().username, task.taskid, course)
+        }
+
+    override suspend fun markBatchAttempted(task: EvalTask, course: EvalCourse): Boolean =
+        kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
+            safety.markAttempted(authStore.current().username, task.taskid, course)
+        }
 
     /** 单个表单只调用其对应保存链；网络失败不重试，防重复提交 */
     override suspend fun submit(course: EvalCourse, item: EvalSubmitItem): EvalResult<Unit> =

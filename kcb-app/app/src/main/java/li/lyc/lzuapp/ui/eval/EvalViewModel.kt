@@ -47,8 +47,14 @@ data class EvalUiState(
     val scrollToQuestion: Long? = null,
     val showAutoFillConfirm: Boolean = false,
     val showBatchConfirm: Boolean = false,
+    val batchPreparing: Boolean = false,
+    val batchPlan: EvalBatchPlan? = null,
+    val batchPreviewError: String? = null,
     val batch: EvalBatchState = EvalBatchState(),
 ) {
+    val blocksBack: Boolean
+        get() = submitting || batch.running || batchPreparing
+
     val hasUnsupported: Boolean
         get() = questions.any { it.type != "单选题" && it.type != "问答题" }
 
@@ -73,6 +79,7 @@ class EvalViewModel(private val repo: EvalDataSource) : ViewModel() {
     private val _uiState = MutableStateFlow(EvalUiState())
     val uiState: StateFlow<EvalUiState> = _uiState.asStateFlow()
 
+    private var batchPreviewJob: kotlinx.coroutines.Job? = null
     private var stopBatch = false
     private var lastActionAt = 0L
     private var coursesGeneration = 0L
@@ -83,7 +90,7 @@ class EvalViewModel(private val repo: EvalDataSource) : ViewModel() {
     }
 
     private fun cooldown(): Boolean {
-        if (_uiState.value.batch.running) return false
+        if (_uiState.value.blocksBack) return false
         val now = System.currentTimeMillis()
         if (now - lastActionAt < 500) return false
         lastActionAt = now
@@ -91,7 +98,7 @@ class EvalViewModel(private val repo: EvalDataSource) : ViewModel() {
     }
 
     fun loadTasks() {
-        if (_uiState.value.batch.running) return
+        if (_uiState.value.blocksBack) return
         viewModelScope.launch {
             _uiState.value = _uiState.value.copy(loading = true, error = null)
             when (val r = repo.tasks()) {
@@ -390,7 +397,7 @@ class EvalViewModel(private val repo: EvalDataSource) : ViewModel() {
     /** 表单按来源退回教师或课程列表，再逐级退回任务列表 */
     fun back() {
         val s = _uiState.value
-        if (s.submitting || s.batch.running) return
+        if (s.blocksBack) return
         when (s.page) {
             EvalPage.FORM -> {
                 val parent = s.teacherParent
@@ -563,27 +570,40 @@ class EvalViewModel(private val repo: EvalDataSource) : ViewModel() {
 
     fun requestBatch() {
         val s = _uiState.value
-        if (s.loading || s.error != null || s.batch.running || s.submitting) return
+        if (s.loading || s.error != null || s.blocksBack) return
         if (s.page != EvalPage.TASKS && s.page != EvalPage.COURSES) return
         if (s.page == EvalPage.TASKS && s.tasks.none { it.currentStatus == "进行中" && it.pjfs == "打分" }) return
         if (s.page == EvalPage.COURSES && (s.task?.currentStatus != "进行中" || s.task.pjfs != "打分")) return
-        _uiState.value = s.copy(showBatchConfirm = true)
+        val taskId = if (s.page == EvalPage.COURSES) s.task?.taskid else null
+        _uiState.value = s.copy(showBatchConfirm = true, batchPreparing = true, batchPlan = null, batchPreviewError = null)
+        batchPreviewJob = viewModelScope.launch {
+            try {
+                val plan = EvalBatchRunner(repo).preview(taskId)
+                _uiState.value = _uiState.value.copy(batchPreparing = false, batchPlan = plan)
+            } catch (e: kotlinx.coroutines.CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                _uiState.value = _uiState.value.copy(batchPreparing = false, batchPreviewError = e.message ?: "预览失败")
+            }
+        }
     }
 
     fun dismissBatch() {
-        _uiState.value = _uiState.value.copy(showBatchConfirm = false)
+        batchPreviewJob?.cancel()
+        _uiState.value = _uiState.value.copy(showBatchConfirm = false, batchPreparing = false, batchPlan = null)
     }
 
     fun startBatch() {
         val s = _uiState.value
-        if (!s.showBatchConfirm || s.batch.running) return
+        val plan = s.batchPlan ?: return
+        if (!s.showBatchConfirm || s.batch.running || s.batchPreparing) return
         stopBatch = false
         val taskId = if (s.page == EvalPage.COURSES) s.task?.taskid else null
         _uiState.value = s.copy(showBatchConfirm = false, batch = EvalBatchState(running = true))
         viewModelScope.launch {
-            EvalBatchRunner(repo).run(taskId, { stopBatch }) { progress ->
+            EvalBatchRunner(repo).run(taskId, { stopBatch }, { progress ->
                 _uiState.value = _uiState.value.copy(batch = progress.copy(stopping = stopBatch && progress.running))
-            }
+            }, plan)
             when (s.page) {
                 EvalPage.COURSES -> s.task?.let { loadCourses(it) }
                 else -> loadTasks()

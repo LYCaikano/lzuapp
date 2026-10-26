@@ -5,6 +5,9 @@ import kotlinx.coroutines.withContext
 import kotlinx.serialization.encodeToString
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonElement
+import kotlinx.serialization.json.jsonObject
+import kotlinx.serialization.json.jsonPrimitive
+import kotlinx.serialization.json.intOrNull
 import li.lyc.lzuapp.data.api.model.EvalAnswer
 import li.lyc.lzuapp.data.api.model.EvalCourse
 import li.lyc.lzuapp.data.api.model.EvalQuestion
@@ -34,12 +37,18 @@ import java.util.concurrent.TimeUnit
  *       HTTP 401、或 message 含「授权失效」「已在其他地方登录」= 鉴权失效（可重新 doLogin 自愈）。
  * 教师查询使用 JSON object，提交使用 JSON 数组，两者 URL 末尾均追加 ?a=1。
  */
-class JwqeApi(private val client: OkHttpClient = defaultClient()) {
+class JwqeApi(
+    private val client: OkHttpClient = defaultClient(),
+    private val gate: EvalRequestGate = EvalRequestGate(),
+) {
 
     companion object {
         const val BASE = "https://jwqe.lzu.edu.cn:8080/api"
 
         fun defaultClient(): OkHttpClient = OkHttpClient.Builder()
+            .retryOnConnectionFailure(false)
+            .followRedirects(false)
+            .followSslRedirects(false)
             .connectTimeout(15, TimeUnit.SECONDS)
             .readTimeout(20, TimeUnit.SECONDS)
             .writeTimeout(20, TimeUnit.SECONDS)
@@ -138,7 +147,7 @@ class JwqeApi(private val client: OkHttpClient = defaultClient()) {
     // ---------- HTTP 封装 ----------
 
     /** form-urlencoded POST 并取出 data.pageData 列表；业务失败抛 [JwqeException] */
-    private inline fun <reified T> pagePost(path: String, params: Map<String, String>, token: String): List<T> {
+    private suspend inline fun <reified T> pagePost(path: String, params: Map<String, String>, token: String): List<T> {
         val form = FormBody.Builder().apply { params.forEach { (k, v) -> add(k, v) } }.build()
         val r = decode<JwqeResponse<JwqePage<T>>>(execute(path, form, token))
         if (r.code != 200 && r.code != 0) {
@@ -148,17 +157,32 @@ class JwqeApi(private val client: OkHttpClient = defaultClient()) {
     }
 
     /** 实际执行请求；HTTP 401 按鉴权失效抛出 */
-    private fun execute(path: String, body: RequestBody, token: String?): String {
-        val request = Request.Builder().url(BASE + path).post(body).apply {
-            if (!token.isNullOrEmpty()) header("Authorization", "Bearer $token")
-        }.build()
-        client.newCall(request).execute().use { resp ->
-            val text = resp.body?.string().orEmpty()
-            if (resp.code == 401) throw JwqeException("授权失效", isAuth = true)
-            if (!resp.isSuccessful) throw JwqeException("HTTP ${resp.code}")
-            return text
+    private suspend fun execute(path: String, body: RequestBody, token: String?): String =
+        gate.request(write = path.contains("/save")) {
+            val request = Request.Builder().url(BASE + path).post(body).apply {
+                if (!token.isNullOrEmpty()) header("Authorization", "Bearer $token")
+            }.build()
+            client.newCall(request).execute().use { resp ->
+                val text = resp.body?.string().orEmpty()
+                val businessCode = if (resp.isSuccessful) runCatching {
+                    json.parseToJsonElement(text).jsonObject["code"]?.jsonPrimitive?.intOrNull
+                }.getOrNull() else null
+                val limitCode = if (resp.code == 429 || resp.code == 403) resp.code else businessCode
+                if (limitCode == 429 || limitCode == 403) {
+                    val now = System.currentTimeMillis()
+                    val retry = resp.header("Retry-After")
+                    val seconds = retry?.toLongOrNull()?.coerceAtLeast(0)
+                    val date = retry?.let {
+                        runCatching { java.time.ZonedDateTime.parse(it, java.time.format.DateTimeFormatter.RFC_1123_DATE_TIME).toInstant().toEpochMilli() }.getOrNull()
+                    }
+                    val minimum = now + if (limitCode == 403) 300_000 else 60_000
+                    throw EvalRateLimitedException(maxOf(minimum, seconds?.let { if (it > (Long.MAX_VALUE - now) / 1000) Long.MAX_VALUE else now + it * 1000 } ?: date ?: 0))
+                }
+                if (resp.code == 401) throw JwqeException("授权失效", isAuth = true)
+                if (!resp.isSuccessful) throw JwqeException("HTTP ${resp.code}")
+                text
+            }
         }
-    }
 
     /** 解析响应；不可解析（HTML 错误页等）统一转业务异常，不把解析栈/乱码抛给上层 */
     private inline fun <reified T> decode(text: String): T =

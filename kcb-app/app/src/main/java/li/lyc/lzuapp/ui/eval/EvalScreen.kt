@@ -81,8 +81,8 @@ fun EvalScreen(
     val context = LocalContext.current
     val snackbarHostState = remember { SnackbarHostState() }
 
-    BackHandler(enabled = state.batch.running || (state.page != EvalPage.TASKS && !state.submitting)) {
-        if (!state.batch.running) vm.back()
+    BackHandler(enabled = state.blocksBack || state.page != EvalPage.TASKS) {
+        if (!state.blocksBack) vm.back()
     }
 
     LaunchedEffect(state.toast) {
@@ -120,14 +120,14 @@ fun EvalScreen(
                 navigationIcon = {
                     IconButton(
                         onClick = { if (state.page == EvalPage.TASKS) onBack() else vm.back() },
-                        enabled = !state.submitting && !state.batch.running,
+                        enabled = !state.blocksBack,
                     ) {
                         Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "返回")
                     }
                 },
                 actions = {
                     if (state.page != EvalPage.FORM) {
-                        IconButton(onClick = vm::retry, enabled = !state.batch.running) {
+                        IconButton(onClick = vm::retry, enabled = !state.blocksBack) {
                             Icon(Icons.Default.Refresh, contentDescription = "刷新")
                         }
                     }
@@ -157,9 +157,28 @@ fun EvalScreen(
             onDismissRequest = vm::dismissBatch,
             title = { Text("一键评教所有课程和老师？") },
             text = {
-                Text("${if (state.page == EvalPage.TASKS) "所有进行中的打分任务" else "当前任务"}中，未评课程和合讲教师将按现有一键高分规则填写并直接提交，评语使用默认中文内容；已评对象会跳过。遇到不支持的题型或提交失败会暂停，可随时停止后续评价。")
+                Column {
+                    if (state.batchPreparing) {
+                        Text("正在查询数量，尚未提交任何评价…")
+                    }
+                    state.batchPreviewError?.let { Text(it, color = MaterialTheme.colorScheme.error) }
+                    state.batchPlan?.let { plan ->
+                        Text("${plan.coursesByTask.size} 个任务，待评课程 ${plan.pendingCourses} 项，预计待评教师 ${plan.pendingTeachers} 项。")
+                        if (plan.unknownTeacherCourses > 0) Text("另有 ${plan.unknownTeacherCourses} 门课程需提交课程评价后才能确认教师数量。")
+                        Text("保护草稿或历史提交记录 ${plan.protected} 项；每次最多提交 ${EvalBatchPlan.MAX_SUBMISSIONS} 项。")
+                        Spacer(Modifier.height(8.dp))
+                        Text("将按现有高分规则和默认中文评语直接提交；已有草稿、已评和结果待确认对象均跳过。遇到失败或限流即暂停，不自动重试提交。")
+                    }
+                }
             },
-            confirmButton = { TextButton(onClick = vm::startBatch) { Text("开始评教并提交") } },
+            confirmButton = {
+                val plan = state.batchPlan
+                TextButton(
+                    onClick = vm::startBatch,
+                    enabled = !state.batchPreparing && plan != null &&
+                        (plan.pendingCourses + plan.pendingTeachers + plan.unknownTeacherCourses > 0),
+                ) { Text("开始本批次（最多20项）") }
+            },
             dismissButton = { TextButton(onClick = vm::dismissBatch) { Text("取消") } },
         )
     }
@@ -210,7 +229,7 @@ private fun BatchBar(state: EvalUiState, vm: EvalViewModel) {
             }
         }
         if (state.batch.running || state.batch.result != null) {
-            Text("已提交 ${state.batch.submitted} 项，跳过已评 ${state.batch.skipped} 项", style = MaterialTheme.typography.bodySmall)
+            Text("已提交 ${state.batch.submitted} 项，跳过已评 ${state.batch.skipped} 项，保护 ${state.batch.protected} 项", style = MaterialTheme.typography.bodySmall)
         }
     }
 }
