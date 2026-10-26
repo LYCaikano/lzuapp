@@ -10,6 +10,7 @@ import android.graphics.ImageDecoder
 import android.location.Location
 import android.location.LocationListener
 import android.location.LocationManager
+import androidx.core.location.LocationManagerCompat
 import android.media.ExifInterface
 import android.net.Uri
 import android.os.Build
@@ -1228,7 +1229,7 @@ private suspend fun fetchLocation(context: Context): Location? {
         locLog(context, "hit lastKnown(30min): ${it.provider} ${it.longitude},${it.latitude}")
         return it
     }
-    val masterOn = runCatching { lm.isLocationEnabled }.getOrDefault(false)
+    val masterOn = runCatching { LocationManagerCompat.isLocationEnabled(lm) }.getOrDefault(false)
     if (!masterOn) locLog(context, "location master switch OFF（仍尝试高德网络定位）")
     // 高德网络定位优先（室内可用；HightAccuracy 模式本身融合 GPS，室外不吃亏）：
     // 返回 GCJ-02，这里归一化为 WGS-84 再走统一管线

@@ -9,6 +9,7 @@ import li.lyc.lzuapp.data.api.model.EvalQuestion
 import li.lyc.lzuapp.data.api.model.EvalSubmitAnswer
 import li.lyc.lzuapp.data.api.model.EvalSubmitItem
 import li.lyc.lzuapp.data.api.model.EvalTask
+import li.lyc.lzuapp.data.api.model.EvalTeacherRecord
 import li.lyc.lzuapp.data.api.model.EvalTeacherQuery
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.sync.Mutex
@@ -30,7 +31,8 @@ class EvalRepository(
     private val lzuApi: LzuApi,
     private val jwqeApi: JwqeApi,
     private val courseRepo: CourseRepository,
-) {
+    private val safety: EvalSafetyStore,
+) : EvalDataSource {
 
     sealed interface EvalResult<out T> {
         data class Ok<T>(val data: T) : EvalResult<T>
@@ -48,7 +50,7 @@ class EvalRepository(
         val s = authStore.current()
         if (s.jwqeToken.isNotEmpty()) return@withLock Result.success(s.jwqeToken)
         val first = loginLocked()
-        if (first.isSuccess) return@withLock first
+        if (first.isSuccess || first.exceptionOrNull() is li.lyc.lzuapp.data.api.EvalRateLimitedException) return@withLock first
         // 首次失败：静默重新登录后重试一次
         val relogin = courseRepo.login(s.username, s.password)
         if (relogin !is LoginResult.Success) {
@@ -76,7 +78,7 @@ class EvalRepository(
         } catch (e: CancellationException) {
             throw e
         } catch (e: Exception) {
-            Result.failure(if (e is java.io.IOException) e else Exception(e.message ?: "评教登录失败"))
+            Result.failure(e)
         }
     }
 
@@ -128,10 +130,10 @@ class EvalRepository(
     }
 
     /** 评教任务列表（pjfs="排名打分" 的任务暂不支持，字段保留供 UI 提示） */
-    suspend fun tasks(): EvalResult<List<EvalTask>> = withEvalRetry { jwqeApi.getTasks(it) }
+    override suspend fun tasks(): EvalResult<List<EvalTask>> = withEvalRetry { jwqeApi.getTasks(it) }
 
     /** 按任务发布方式选择普通课程或合讲课程查询 */
-    suspend fun courses(task: EvalTask): EvalResult<List<EvalCourse>> = withEvalRetry {
+    override suspend fun courses(task: EvalTask): EvalResult<List<EvalCourse>> = withEvalRetry {
         val isJointTask = task.objecttask == "当前" && task.taskfbfs == "根据合讲教师数评价"
         val courses = if (isJointTask) {
             jwqeApi.getStudentEvaluation(it, task.taskid.toString()).map { course ->
@@ -147,16 +149,17 @@ class EvalRepository(
     }
 
     /** 合讲教师查询，保留父课程信息及教师自己的评价状态 */
-    suspend fun teachers(task: EvalTask, course: EvalCourse): EvalResult<List<EvalCourse>> = withEvalRetry {
-        val query = EvalTeacherQuery(
-            taskid = task.taskid,
-            yearterm = course.yearterm,
-            coursecode = course.coursecode,
-            page = 1,
-            limit = 50,
-            pjcoursetype = course.pjcoursetype,
-        )
-        jwqeApi.getJobnumberEvaluation(it, query).map { teacher ->
+    override suspend fun teachers(task: EvalTask, course: EvalCourse): EvalResult<List<EvalCourse>> = withEvalRetry {
+        val records = linkedMapOf<Pair<String?, String>, EvalTeacherRecord>()
+        var page = 1
+        do {
+            check(page <= 20) { "教师分页超过20页，请手动检查" }
+            val query = EvalTeacherQuery(task.taskid, course.yearterm, course.coursecode, page++, 50, course.pjcoursetype)
+            val batch = jwqeApi.getJobnumberEvaluation(it, query)
+            val added = mergeTeacherPage(records, batch)
+            check(batch.isEmpty() || added > 0 || batch.size < 50) { "教师列表分页未更新，请稍后重试" }
+        } while (batch.size == 50)
+        records.values.map { teacher ->
             normalizeCourse(
                 course.copy(
                     teachername = teacher.teachername,
@@ -172,16 +175,39 @@ class EvalRepository(
     }
 
     /** 指标体系题目（indexid 传任务原始逗号串即可） */
-    suspend fun questions(indexid: String, pjcoursetype: String): EvalResult<List<EvalQuestion>> =
+    override suspend fun questions(indexid: String, pjcoursetype: String): EvalResult<List<EvalQuestion>> =
         withEvalRetry { jwqeApi.getQuestions(it, indexid, pjcoursetype) }
 
     /** 已提交答案（回填已评/暂存） */
-    suspend fun savedAnswers(pjjgid: Long): EvalResult<List<EvalAnswer>> =
+    override suspend fun savedAnswers(pjjgid: Long): EvalResult<List<EvalAnswer>> =
         withEvalRetry { jwqeApi.getAnswers(it, pjjgid) }
 
-    /** 单个表单只调用其对应保存链；网络失败不重试，防重复提交 */
-    suspend fun submit(course: EvalCourse, item: EvalSubmitItem): EvalResult<Unit> =
-        withEvalRetry(retryOnNetwork = false) { jwqeApi.submit(it, listOf(item), course.pjtype) }
+    override suspend fun wasBatchAttempted(task: EvalTask, course: EvalCourse): Boolean =
+        kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
+            safety.attempted(authStore.current().username, task.taskid, course)
+        }
+
+    /** Manual and batch submissions share the same preflight/transport journal. */
+    override suspend fun submit(course: EvalCourse, item: EvalSubmitItem, batch: Boolean): EvalResult<Unit> =
+        kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
+            try {
+                val key = safety.submissionKey(authStore.current().username, item.taskid, course)
+                safety.journal.submit(key, repeatConfirmed = !batch) { beforeSend ->
+                    // Convert Err to an exception inside the journal so preflight failures release claims.
+                    when (val result = withEvalRetry(retryOnNetwork = false) {
+                        jwqeApi.submit(it, listOf(item), course.pjtype, beforeSend)
+                    }) {
+                        is EvalResult.Ok -> Unit
+                        is EvalResult.Err -> throw IllegalStateException(result.message)
+                    }
+                }
+                EvalResult.Ok(Unit)
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                EvalResult.Err(e.message ?: "提交失败")
+            }
+        }
 
     companion object {
         /** 服务目录中「学生评教」的 service_info_id */

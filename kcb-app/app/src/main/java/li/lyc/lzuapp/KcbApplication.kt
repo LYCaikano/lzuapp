@@ -59,8 +59,9 @@ class AppContainer(context: Context) {
     val repository: CourseRepository = CourseRepository(context, api, authStore, database)
     val yktApi: YktApi = YktApi()
     val yktRepository: YktRepository = YktRepository(authStore, api, yktApi, repository)
-    val jwqeApi: JwqeApi = JwqeApi()
-    val evalRepository: EvalRepository = EvalRepository(authStore, api, jwqeApi, repository)
+    private val evalSafety = li.lyc.lzuapp.data.repo.EvalSafetyStore(context)
+    val jwqeApi: JwqeApi = JwqeApi(gate = li.lyc.lzuapp.data.api.EvalRequestGate(evalSafety))
+    val evalRepository: EvalRepository = EvalRepository(authStore, api, jwqeApi, repository, evalSafety)
     val fdmApi: FdmApi = FdmApi()
     val fdmRepository: FdmRepository = FdmRepository(authStore, api, fdmApi, repository)
     val netRepository: li.lyc.lzuapp.data.repo.NetRepository =

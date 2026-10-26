@@ -81,7 +81,9 @@ fun EvalScreen(
     val context = LocalContext.current
     val snackbarHostState = remember { SnackbarHostState() }
 
-    BackHandler(enabled = state.page != EvalPage.TASKS && !state.submitting) { vm.back() }
+    BackHandler(enabled = state.blocksBack || state.page != EvalPage.TASKS) {
+        if (!state.blocksBack) vm.back()
+    }
 
     LaunchedEffect(state.toast) {
         state.toast?.let { Toast.makeText(context, it, Toast.LENGTH_SHORT).show(); vm.toastShown() }
@@ -118,14 +120,14 @@ fun EvalScreen(
                 navigationIcon = {
                     IconButton(
                         onClick = { if (state.page == EvalPage.TASKS) onBack() else vm.back() },
-                        enabled = !state.submitting,
+                        enabled = !state.blocksBack,
                     ) {
                         Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "返回")
                     }
                 },
                 actions = {
                     if (state.page != EvalPage.FORM) {
-                        IconButton(onClick = vm::retry) {
+                        IconButton(onClick = vm::retry, enabled = !state.blocksBack) {
                             Icon(Icons.Default.Refresh, contentDescription = "刷新")
                         }
                     }
@@ -134,13 +136,51 @@ fun EvalScreen(
         },
     ) { padding ->
         Box(Modifier.fillMaxSize().padding(padding)) {
-            when (state.page) {
-                EvalPage.TASKS -> TaskListView(state, vm)
-                EvalPage.COURSES -> CourseListView(state, vm)
-                EvalPage.TEACHERS -> TeacherListView(state, vm)
-                EvalPage.FORM -> FormView(state, vm)
+            Column(Modifier.fillMaxSize()) {
+                if (state.page == EvalPage.TASKS || state.page == EvalPage.COURSES) {
+                    BatchBar(state, vm)
+                }
+                Box(Modifier.weight(1f)) {
+                    when (state.page) {
+                        EvalPage.TASKS -> TaskListView(state, vm)
+                        EvalPage.COURSES -> CourseListView(state, vm)
+                        EvalPage.TEACHERS -> TeacherListView(state, vm)
+                        EvalPage.FORM -> FormView(state, vm)
+                    }
+                }
             }
         }
+    }
+
+    if (state.showBatchConfirm) {
+        AlertDialog(
+            onDismissRequest = vm::dismissBatch,
+            title = { Text("一键评教所有课程和老师？") },
+            text = {
+                Column {
+                    if (state.batchPreparing) {
+                        Text("正在查询数量，尚未提交任何评价…")
+                    }
+                    state.batchPreviewError?.let { Text(it, color = MaterialTheme.colorScheme.error) }
+                    state.batchPlan?.let { plan ->
+                        Text("${plan.coursesByTask.size} 个任务，待评课程 ${plan.pendingCourses} 项，预计待评教师 ${plan.pendingTeachers} 项。")
+                        if (plan.unknownTeacherCourses > 0) Text("另有 ${plan.unknownTeacherCourses} 门课程需提交课程评价后才能确认教师数量。")
+                        Text("保护草稿或历史提交记录 ${plan.protected} 项；每次最多提交 ${EvalBatchPlan.MAX_SUBMISSIONS} 项。")
+                        Spacer(Modifier.height(8.dp))
+                        Text("将按现有高分规则和默认中文评语直接提交；已有草稿、已评和结果待确认对象均跳过。遇到失败或限流即暂停，不自动重试提交。")
+                    }
+                }
+            },
+            confirmButton = {
+                val plan = state.batchPlan
+                TextButton(
+                    onClick = vm::startBatch,
+                    enabled = !state.batchPreparing && plan != null &&
+                        (plan.pendingCourses + plan.pendingTeachers + plan.unknownTeacherCourses > 0),
+                ) { Text("开始本批次（最多20项）") }
+            },
+            dismissButton = { TextButton(onClick = vm::dismissBatch) { Text("取消") } },
+        )
     }
 
     if (state.showAutoFillConfirm) {
@@ -160,6 +200,40 @@ fun EvalScreen(
     }
 }
 
+@Composable
+private fun BatchBar(state: EvalUiState, vm: EvalViewModel) {
+    val eligible = if (state.page == EvalPage.TASKS) {
+        state.tasks.any { it.currentStatus == "进行中" && it.pjfs == "打分" }
+    } else {
+        state.task?.currentStatus == "进行中" && state.task.pjfs == "打分"
+    }
+    if (!eligible && state.batch.result == null && !state.batch.running) return
+    Column(Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 8.dp)) {
+        if (state.batch.running) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                CircularProgressIndicator(Modifier.size(18.dp), strokeWidth = 2.dp)
+                Spacer(Modifier.width(8.dp))
+                Text(if (state.batch.stopping) "正在停止，等待当前请求结束…" else "正在批量评教…")
+            }
+            Text(state.batch.current, style = MaterialTheme.typography.bodySmall)
+            TextButton(onClick = vm::stopBatch, enabled = !state.batch.stopping) { Text("停止后续评价") }
+        } else {
+            Button(
+                onClick = vm::requestBatch,
+                enabled = eligible && !state.loading && state.error == null,
+                modifier = Modifier.fillMaxWidth(),
+            ) { Text("一键评教所有课程和老师") }
+            state.batch.result?.let {
+                Text(it, style = MaterialTheme.typography.bodySmall)
+                Text(state.batch.current, style = MaterialTheme.typography.bodySmall)
+            }
+        }
+        if (state.batch.running || state.batch.result != null) {
+            Text("已提交 ${state.batch.submitted} 项，跳过已评 ${state.batch.skipped} 项，保护 ${state.batch.protected} 项", style = MaterialTheme.typography.bodySmall)
+        }
+    }
+}
+
 // ---------- 任务列表 ----------
 
 @Composable
@@ -173,7 +247,7 @@ private fun TaskListView(state: EvalUiState, vm: EvalViewModel) {
             contentPadding = PaddingValues(start = 16.dp, end = 16.dp, top = 8.dp, bottom = 16.dp),
             verticalArrangement = Arrangement.spacedBy(8.dp),
         ) {
-            items(state.tasks) { t -> TaskCard(t, onClick = { vm.openTask(t) }) }
+            items(state.tasks, key = { it.taskid }, contentType = { "task" }) { t -> TaskCard(t, onClick = { if (!state.batch.running) vm.openTask(t) }) }
         }
     }
 }
@@ -259,9 +333,9 @@ private fun CourseListView(state: EvalUiState, vm: EvalViewModel) {
             contentPadding = PaddingValues(start = 16.dp, end = 16.dp, top = 8.dp, bottom = 16.dp),
             verticalArrangement = Arrangement.spacedBy(8.dp),
         ) {
-            items(state.courses) { c ->
+            items(state.courses, key = { listOf(it.id, it.coursecode, it.classno, it.yearterm, it.pjcoursetype, it.jobnumber).joinToString("|") }, contentType = { "course" }) { c ->
                 val taskActive = state.task?.currentStatus == "进行中"
-                val openable = c.isEvaluated || taskActive
+                val openable = !state.batch.running && (c.isEvaluated || taskActive)
                 CourseRow(
                     c = c,
                     openable = openable,
@@ -373,14 +447,14 @@ private fun TeacherListView(state: EvalUiState, vm: EvalViewModel) {
             contentPadding = PaddingValues(start = 16.dp, end = 16.dp, top = 8.dp, bottom = 16.dp),
             verticalArrangement = Arrangement.spacedBy(8.dp),
         ) {
-            item {
+            item(key = "course_header", contentType = "header") {
                 Text(
                     "课程：${state.course?.coursename.orEmpty()}",
                     style = MaterialTheme.typography.titleSmall,
                     fontWeight = FontWeight.Medium,
                 )
             }
-            items(state.teachers) { teacher ->
+            items(state.teachers, key = { "${it.jobnumber}|${it.teachername}" }, contentType = { "teacher" }) { teacher ->
                 val taskActive = state.task?.currentStatus == "进行中"
                 TeacherRow(
                     teacher = teacher,
@@ -436,7 +510,7 @@ private fun FormView(state: EvalUiState, vm: EvalViewModel) {
                     contentPadding = PaddingValues(start = 16.dp, end = 16.dp, top = 8.dp, bottom = 16.dp),
                     verticalArrangement = Arrangement.spacedBy(8.dp),
                 ) {
-                    item { FormHeader(state) }
+                    item(key = "form_header", contentType = "header") { FormHeader(state) }
                     questionItems(state, vm)
                 }
                 SubmitBar(state, vm)
@@ -449,7 +523,7 @@ private fun FormView(state: EvalUiState, vm: EvalViewModel) {
 private fun LazyListScope.questionItems(state: EvalUiState, vm: EvalViewModel) {
     state.questions.groupBy { it.firstlevlindex }.forEach { (group, qs) ->
         if (group.isNotEmpty()) {
-            item(key = "header_$group") {
+            item(key = "header_$group", contentType = "header") {
                 Text(
                     group,
                     Modifier.padding(top = 8.dp),
@@ -459,7 +533,7 @@ private fun LazyListScope.questionItems(state: EvalUiState, vm: EvalViewModel) {
                 )
             }
         }
-        items(qs, key = { it.indexid }) { q -> QuestionCard(q, state, vm) }
+        items(qs, key = { it.indexid }, contentType = { it.type }) { q -> QuestionCard(q, state, vm) }
     }
 }
 
