@@ -125,11 +125,11 @@ class NetViewModel(
         return true
     }
 
-    /** 一键登录专用 3s 冷却（防疯狂点击触发门户风控），与通用 500ms 冷却独立 */
+    /** 一键登录专用 750ms 冷却（防疯狂点击触发门户风控），与通用 500ms 冷却独立 */
     private var lastLoginAt = 0L
     private fun loginCoolDown(): Boolean {
         val now = System.currentTimeMillis()
-        if (now - lastLoginAt < 3_000) return false
+        if (now - lastLoginAt < 750) return false
         lastLoginAt = now
         return true
     }

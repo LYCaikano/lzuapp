@@ -57,35 +57,53 @@ private object CryptoBox {
     private val decCache = java.util.concurrent.ConcurrentHashMap<String, String>(32)
 
     fun enc(plain: String): String {
-        if (plain.isEmpty() || plain.startsWith(PREFIX)) return plain
-        return runCatching {
+        if (plain.isEmpty()) return plain
+        return try {
             val cipher = Cipher.getInstance("AES/GCM/NoPadding")
             cipher.init(Cipher.ENCRYPT_MODE, secretKey)
             Base64.encodeToString(cipher.iv + cipher.doFinal(plain.toByteArray(Charsets.UTF_8)), Base64.NO_WRAP)
                 .let { PREFIX + it }
-        }.getOrElse {
-            // Keystore 故障不应静默回落明文（落盘即明文泄露）；至少留日志
-            android.util.Log.e("CryptoBox", "enc failed, storing plaintext", it)
-            plain
+        } catch (e: Exception) {
+            android.util.Log.e("CryptoBox", "enc failed", e)
+            throw IllegalStateException("敏感信息加密失败，未写入存储", e)
         }
+    }
+
+    private fun decrypt(stored: String): String {
+        decCache[stored]?.let { return it }
+        val raw = Base64.decode(stored.removePrefix(PREFIX), Base64.NO_WRAP)
+        require(raw.size >= 28) { "GCM ciphertext is too short" }
+        val cipher = Cipher.getInstance("AES/GCM/NoPadding")
+        cipher.init(Cipher.DECRYPT_MODE, secretKey, GCMParameterSpec(128, raw, 0, 12))
+        val plain = String(cipher.doFinal(raw, 12, raw.size - 12), Charsets.UTF_8)
+        if (decCache.size > 256) decCache.clear() // 简单防膨胀（密钥不变，清了只是重算）
+        decCache[stored] = plain
+        return plain
     }
 
     fun dec(stored: String): String {
         if (!stored.startsWith(PREFIX)) return stored
-        decCache[stored]?.let { return it }
-        val plain = runCatching {
-            val raw = Base64.decode(stored.removePrefix(PREFIX), Base64.NO_WRAP)
-            val cipher = Cipher.getInstance("AES/GCM/NoPadding")
-            cipher.init(Cipher.DECRYPT_MODE, secretKey, GCMParameterSpec(128, raw, 0, 12))
-            String(cipher.doFinal(raw, 12, raw.size - 12), Charsets.UTF_8)
-        }.getOrElse {
+        return try {
+            decrypt(stored)
+        } catch (e: Exception) {
             // 解密失败（暂时性 Keystore 故障）不缓存空值，避免把"未登录"状态固化
-            android.util.Log.e("CryptoBox", "dec failed", it)
-            return ""
+            android.util.Log.e("CryptoBox", "dec failed", e)
+            ""
         }
-        if (decCache.size > 256) decCache.clear() // 简单防膨胀（密钥不变，清了只是重算）
-        decCache[stored] = plain
-        return plain
+    }
+
+    fun migrate(stored: String): String {
+        if (stored.isEmpty()) return stored
+        if (!stored.startsWith(PREFIX)) return enc(stored)
+        return try {
+            decrypt(stored)
+            stored
+        } catch (e: javax.crypto.BadPaddingException) {
+            // 旧版本曾把以 v1: 开头的明文原样落盘；认证失败时按原始明文重新加密
+            enc(stored)
+        } catch (e: IllegalArgumentException) {
+            enc(stored)
+        }
     }
 }
 
@@ -129,6 +147,8 @@ class AuthStore(private val context: Context) {
         // 用户协议：记录已同意协议的学号（永久免弹，换号重新确认）
         private val KEY_AGREEMENT_USER = stringPreferencesKey("agreement_user")
         private val KEY_AMAP_API_KEY = stringPreferencesKey("amap_api_key")
+        private val KEY_APP_ORDER = stringPreferencesKey("app_order")
+        private val KEY_HIDDEN_APPS = stringPreferencesKey("hidden_apps")
     }
 
     /** 校园网账户（type = campus / study，见 NetRepository.AccountType.storage） */
@@ -148,6 +168,12 @@ class AuthStore(private val context: Context) {
     )
 
     private val netAccountJson = kotlinx.serialization.json.Json { ignoreUnknownKeys = true }
+
+    data class UserInfoSnapshot(
+        val userName: String,
+        val college: String,
+        val xykh: String,
+    )
 
     data class AuthState(
         val username: String = "",
@@ -189,6 +215,8 @@ class AuthStore(private val context: Context) {
         /** 已同意用户协议的学号（该学号登录不再弹协议窗） */
         val agreementUser: String = "",
         val amapApiKey: String = "",
+        val appOrder: List<String> = emptyList(),
+        val hiddenApps: Set<String> = emptySet(),
     ) {
         val isLoggedIn: Boolean get() = loginToken.isNotEmpty() && gatewayToken.isNotEmpty()
 
@@ -241,25 +269,42 @@ class AuthStore(private val context: Context) {
             netActiveId = p[KEY_NET_ACTIVE].orEmpty(),
             agreementUser = p[KEY_AGREEMENT_USER].orEmpty(),
             amapApiKey = CryptoBox.dec(p[KEY_AMAP_API_KEY].orEmpty()),
+            appOrder = p[KEY_APP_ORDER].orEmpty().split(',').filter { it.isNotEmpty() },
+            hiddenApps = p[KEY_HIDDEN_APPS].orEmpty().split(',').filterTo(mutableSetOf()) { it.isNotEmpty() },
         )
     }.flowOn(kotlinx.coroutines.Dispatchers.Default) // 解密/映射不占用主线程
 
     /** 保存校园卡 etToken（默认 23 小时有效，实际 JWT 约 1 天） */
-    suspend fun saveEtToken(token: String, accNum: String) {
+    suspend fun saveEtToken(token: String, accNum: String, expectedLoginToken: String): Boolean {
+        var saved = false
         context.dataStore.edit { p ->
+            val currentLoginToken = CryptoBox.dec(p[KEY_LOGIN_TOKEN].orEmpty())
+            if (currentLoginToken.isEmpty() || currentLoginToken != expectedLoginToken) return@edit
             p[KEY_ET_TOKEN] = CryptoBox.enc(token)
             p[KEY_ET_EXPIRY] = System.currentTimeMillis() + 23 * 3600_000L
             p[KEY_YKT_ACC_NUM] = accNum
+            saved = true
         }
+        return saved
     }
 
     /** 保存校园卡账户缓存（EPID/主卡卡号/姓名） */
-    suspend fun saveYktAccount(epid: String, cardAccNum: String, accName: String) {
+    suspend fun saveYktAccount(
+        epid: String,
+        cardAccNum: String,
+        accName: String,
+        expectedLoginToken: String,
+    ): Boolean {
+        var saved = false
         context.dataStore.edit { p ->
+            val currentLoginToken = CryptoBox.dec(p[KEY_LOGIN_TOKEN].orEmpty())
+            if (currentLoginToken.isEmpty() || currentLoginToken != expectedLoginToken) return@edit
             p[KEY_YKT_EPID] = epid
             p[KEY_YKT_CARD_ACC_NUM] = cardAccNum
             p[KEY_YKT_ACC_NAME] = CryptoBox.enc(accName)
+            saved = true
         }
+        return saved
     }
 
     /** 清除校园卡 token（失效时强制重换） */
@@ -271,8 +316,15 @@ class AuthStore(private val context: Context) {
     }
 
     /** 保存评教（jwqe）accessToken */
-    suspend fun saveJwqeToken(token: String) {
-        context.dataStore.edit { p -> p[KEY_JWQE_TOKEN] = CryptoBox.enc(token) }
+    suspend fun saveJwqeToken(token: String, expectedLoginToken: String): Boolean {
+        var saved = false
+        context.dataStore.edit { p ->
+            val currentLoginToken = CryptoBox.dec(p[KEY_LOGIN_TOKEN].orEmpty())
+            if (currentLoginToken.isEmpty() || currentLoginToken != expectedLoginToken) return@edit
+            p[KEY_JWQE_TOKEN] = CryptoBox.enc(token)
+            saved = true
+        }
+        return saved
     }
 
     /** 清除评教 token（授权失效时强制重新 doLogin） */
@@ -290,6 +342,46 @@ class AuthStore(private val context: Context) {
         context.dataStore.edit { p ->
             if (key.isEmpty()) p.remove(KEY_AMAP_API_KEY)
             else p[KEY_AMAP_API_KEY] = CryptoBox.enc(key)
+        }
+    }
+
+    suspend fun saveAppLayout(order: List<String>, hidden: Set<String>) {
+        context.dataStore.edit { p ->
+            p[KEY_APP_ORDER] = order.joinToString(",")
+            p[KEY_HIDDEN_APPS] = hidden.joinToString(",")
+        }
+    }
+
+    suspend fun saveAppOrder(order: List<String>) {
+        context.dataStore.edit { p ->
+            p[KEY_APP_ORDER] = order.joinToString(",")
+        }
+    }
+
+    suspend fun hideApp(appId: String) {
+        require(appId.isNotBlank())
+        context.dataStore.edit { p ->
+            val hidden = p[KEY_HIDDEN_APPS].orEmpty().split(',')
+                .filterTo(mutableSetOf()) { it.isNotEmpty() }
+            p[KEY_HIDDEN_APPS] = (hidden + appId).sorted().joinToString(",")
+        }
+    }
+
+    suspend fun setAppVisibility(appId: String, visible: Boolean) {
+        require(appId.isNotBlank())
+        context.dataStore.edit { p ->
+            val hidden = p[KEY_HIDDEN_APPS].orEmpty().split(',')
+                .filterTo(mutableSetOf()) { it.isNotEmpty() }
+            val updated = if (visible) hidden - appId else hidden + appId
+            p[KEY_HIDDEN_APPS] = updated.sorted().joinToString(",")
+        }
+    }
+
+    suspend fun restoreAllApps() {
+        context.dataStore.edit { p ->
+            val hidden = p[KEY_HIDDEN_APPS].orEmpty().split(',')
+                .filterTo(mutableSetOf()) { it.isNotEmpty() }
+            if (hidden.isNotEmpty()) p.remove(KEY_HIDDEN_APPS)
         }
     }
 
@@ -361,6 +453,30 @@ class AuthStore(private val context: Context) {
         }
     }
 
+    suspend fun saveAuthenticatedSnapshot(
+        username: String,
+        password: String,
+        deviceId: String,
+        loginToken: String,
+        gatewayToken: String,
+        userInfo: UserInfoSnapshot? = null,
+    ) {
+        context.dataStore.edit { p ->
+            p[KEY_USERNAME] = username
+            p[KEY_PASSWORD] = CryptoBox.enc(password)
+            p[KEY_DEVICE_ID] = deviceId
+            p[KEY_LOGIN_TOKEN] = CryptoBox.enc(loginToken)
+            p[KEY_GATEWAY_TOKEN] = CryptoBox.enc(gatewayToken)
+            p.remove(KEY_ACCESS_TOKEN)
+            p.remove(KEY_ACCESS_EXPIRY)
+            if (userInfo != null) {
+                p[KEY_USER_NAME] = CryptoBox.enc(userInfo.userName)
+                p[KEY_COLLEGE] = CryptoBox.enc(userInfo.college)
+                p[KEY_XYKH] = CryptoBox.enc(userInfo.xykh)
+            }
+        }
+    }
+
     suspend fun saveLoginResult(loginToken: String, gatewayToken: String) {
         context.dataStore.edit { p ->
             p[KEY_LOGIN_TOKEN] = CryptoBox.enc(loginToken)
@@ -393,10 +509,7 @@ class AuthStore(private val context: Context) {
         context.dataStore.edit { p -> p[KEY_LAST_SYNC] = System.currentTimeMillis() }
     }
 
-    /**
-     * 历史明文敏感字段一次性升级为密文（安装后首次启动调用）。
-     * 读 -> 解密兼容读 -> 重新加密写回；已是密文的字段 enc() 原样返回，幂等。
-     */
+    /** 历史明文及旧版误保留的 v1: 前缀明文升级为密文，有效密文保持原值。 */
     suspend fun migrateEncryption() {
         context.dataStore.edit { p ->
             listOf(
@@ -405,26 +518,27 @@ class AuthStore(private val context: Context) {
                 KEY_NET_PASSWORD, KEY_JWQE_TOKEN, KEY_AMAP_API_KEY,
             ).forEach { k ->
                 val v = p[k]
-                if (!v.isNullOrEmpty() && !v.startsWith("v1:")) p[k] = CryptoBox.enc(v)
+                if (!v.isNullOrEmpty()) p[k] = CryptoBox.migrate(v)
+            }
+            val accounts = p[KEY_NET_ACCOUNTS]?.let { raw ->
+                runCatching { netAccountJson.decodeFromString<List<NetAccountJson>>(raw) }.getOrNull()
+            }
+            if (accounts != null) {
+                p[KEY_NET_ACCOUNTS] = netAccountJson.encodeToString(
+                    accounts.map { it.copy(password = CryptoBox.migrate(it.password)) },
+                )
             }
         }
     }
 
-    /**
-     * 退出登录：清除全部凭据与个人数据（含密码/姓名/学院/一卡通号），
-     * 仅保留 username 供下次登录预填。
-     */
-    suspend fun logout() {
+    /** 退出第一阶段：清个人数据，暂留登录令牌，避免清理过程中提前切换 UI。 */
+    suspend fun clearAccountData() {
         context.dataStore.edit { p ->
             p.remove(KEY_PASSWORD)
-            p.remove(KEY_LOGIN_TOKEN)
-            p.remove(KEY_GATEWAY_TOKEN)
-            p.remove(KEY_ACCESS_TOKEN)
-            p.remove(KEY_ACCESS_EXPIRY)
-            p.remove(KEY_SKIP_CAPTCHA)
             p.remove(KEY_USER_NAME)
             p.remove(KEY_COLLEGE)
             p.remove(KEY_XYKH)
+            p.remove(KEY_LAST_SYNC)
             p.remove(KEY_ET_TOKEN)
             p.remove(KEY_ET_EXPIRY)
             p.remove(KEY_JWQE_TOKEN)
@@ -433,10 +547,29 @@ class AuthStore(private val context: Context) {
             p.remove(KEY_YKT_EPID)
             p.remove(KEY_YKT_CARD_ACC_NUM)
             p.remove(KEY_YKT_ACC_NAME)
-            // 校园网凭据同属敏感数据，退出登录时一并清除（自动登录开关保留无意义）
             p.remove(KEY_NET_USERNAME)
             p.remove(KEY_NET_PASSWORD)
+            p.remove(KEY_NET_ACCOUNT_TYPE)
             p.remove(KEY_NET_AUTO_LOGIN)
+            p.remove(KEY_NET_ACCOUNTS)
+            p.remove(KEY_NET_ACTIVE)
         }
+    }
+
+    /** 退出最后阶段：撤销登录态并清除短信会话。 */
+    suspend fun clearLoginState() {
+        context.dataStore.edit { p ->
+            p.remove(KEY_LOGIN_TOKEN)
+            p.remove(KEY_GATEWAY_TOKEN)
+            p.remove(KEY_ACCESS_TOKEN)
+            p.remove(KEY_ACCESS_EXPIRY)
+            p.remove(KEY_SKIP_CAPTCHA)
+        }
+    }
+
+    /** 仅保留 username 供下次登录预填。 */
+    suspend fun logout() {
+        clearAccountData()
+        clearLoginState()
     }
 }

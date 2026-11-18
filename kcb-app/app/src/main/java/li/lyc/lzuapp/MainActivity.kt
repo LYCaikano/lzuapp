@@ -288,6 +288,7 @@ class MainActivity : ComponentActivity() {
                                         modifier = Modifier.padding(padding),
                                     )
                                     2 -> li.lyc.lzuapp.ui.apps.AppsScreen(
+                                        authStore = container.authStore,
                                         onOpenDorm = { showDorm = true },
                                         onOpenNet = { showNet = true },
                                         onOpenGrade = { showGrade = true },

@@ -16,6 +16,7 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
+import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.launch
 import li.lyc.lzuapp.KcbApplication
 import li.lyc.lzuapp.MainActivity
@@ -60,6 +61,7 @@ class NetAuthService : Service() {
         showForeground("正在登录校园网…")
         scope.launch {
             val msg = repository.ensureOnline(repository.wifiNetwork())
+            ensureActive()
             val wifiGone = repository.wifiNetwork() == null
             when {
                 // 认证途中手动断开 Wi-Fi：静默撤掉通知，不打扰

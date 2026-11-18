@@ -21,8 +21,8 @@ android {
         applicationId = "li.lyc.lzuapp"
         minSdk = 26
         targetSdk = 36
-        versionCode = 10
-        versionName = "0.3.2"
+        versionCode = 11
+        versionName = "0.3.3"
         manifestPlaceholders += mapOf("AMAP_API_KEY" to amapApiKey)
     }
 

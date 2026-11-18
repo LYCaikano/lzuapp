@@ -174,7 +174,7 @@ class FdmRepository(
         android.util.Log.w("FdmRepo", "fdmLogin failed: ${first.exceptionOrNull()?.message}，尝试静默重登录")
         if (first.exceptionOrNull() is java.io.IOException) return first
         val s = authStore.current()
-        val relogin = courseRepo.login(s.username, s.password)
+        val relogin = courseRepo.login(s.username, s.password, expectedSession = s)
         if (relogin !is LoginResult.Success) {
             log("ensureSession: 静默重登录失败")
             return Result.failure(

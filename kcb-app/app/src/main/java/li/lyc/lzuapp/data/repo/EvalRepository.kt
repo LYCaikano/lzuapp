@@ -52,7 +52,7 @@ class EvalRepository(
         val first = loginLocked()
         if (first.isSuccess || first.exceptionOrNull() is li.lyc.lzuapp.data.api.EvalRateLimitedException) return@withLock first
         // 首次失败：静默重新登录后重试一次
-        val relogin = courseRepo.login(s.username, s.password)
+        val relogin = courseRepo.login(s.username, s.password, expectedSession = s)
         if (relogin !is LoginResult.Success) {
             return@withLock Result.failure(
                 if (relogin is LoginResult.Failed && relogin.reason == SyncFailReason.NETWORK)
@@ -73,8 +73,11 @@ class EvalRepository(
         if (st.isEmpty()) return Result.failure(Exception("登录状态失效"))
         return try {
             val token = jwqeApi.doLogin(st)
-            authStore.saveJwqeToken(token)
-            Result.success(token)
+            if (!authStore.saveJwqeToken(token, cur.loginToken)) {
+                Result.failure(Exception("登录已过期，请重试"))
+            } else {
+                Result.success(token)
+            }
         } catch (e: CancellationException) {
             throw e
         } catch (e: Exception) {

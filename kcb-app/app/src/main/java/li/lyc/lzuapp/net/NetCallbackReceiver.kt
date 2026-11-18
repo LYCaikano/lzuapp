@@ -1,5 +1,6 @@
 package li.lyc.lzuapp.net
 
+import android.app.NotificationManager
 import android.app.PendingIntent
 import android.content.BroadcastReceiver
 import android.content.Context
@@ -24,6 +25,10 @@ object NetAutoLogin {
 
     /** 按开关注册/注销 Wi-Fi 事件回调（幂等） */
     fun syncState(context: Context, enabled: Boolean) {
+        if (!enabled) {
+            context.stopService(Intent(context, NetAuthService::class.java))
+            context.getSystemService(NotificationManager::class.java)?.cancel(NetAuthService.NOTIF_ID)
+        }
         val cm = context.getSystemService(ConnectivityManager::class.java) ?: return
         val pi = pendingIntent(context)
         runCatching { cm.unregisterNetworkCallback(pi) } // 先注销，防重复注册

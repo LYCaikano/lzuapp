@@ -72,13 +72,15 @@ class YktRepository(
         val s = authStore.current()
         if (s.etValid) {
             // EPID 缓存为空（此前 GetAccInfo 失败被吞）时补拉，否则后续业务必败
-            if (s.yktEpid.isEmpty()) refreshAccountLocked(s.etToken, s.yktAccNum)
+            if (s.yktEpid.isEmpty() && !refreshAccountLocked(s.etToken, s.yktAccNum, s.loginToken)) {
+                return@withLock Result.failure(Exception("登录已过期，请重试"))
+            }
             return@withLock Result.success(s.etToken)
         }
         val first = exchangeLocked()
         if (first.isSuccess) return@withLock first
         // 首次失败：静默重新登录后重试一次
-        val relogin = courseRepo.login(s.username, s.password)
+        val relogin = courseRepo.login(s.username, s.password, expectedSession = s)
         if (relogin !is LoginResult.Success) {
             return@withLock Result.failure(
                 if (relogin is LoginResult.Failed && relogin.reason == SyncFailReason.NETWORK)
@@ -106,21 +108,28 @@ class YktRepository(
         val token = resp.field("token").orEmpty()
         val accNum = resp.field("accNum").orEmpty()
         if (token.isEmpty() || accNum.isEmpty()) return Result.failure(Exception("换取校园卡令牌失败"))
-        authStore.saveEtToken(token, accNum)
-        refreshAccountLocked(token, accNum)
+        if (!authStore.saveEtToken(token, accNum, cur.loginToken)) {
+            return Result.failure(Exception("登录已过期，请重试"))
+        }
+        if (!refreshAccountLocked(token, accNum, cur.loginToken)) {
+            return Result.failure(Exception("登录已过期，请重试"))
+        }
         return Result.success(token)
     }
 
-    /** 拉 GetAccInfo 刷新账户缓存（EPID/主卡/姓名）；失败不阻塞，下次操作时重试 */
-    private suspend fun refreshAccountLocked(token: String, accNum: String) {
+    /** 拉 GetAccInfo 刷新账户缓存；普通失败不阻塞，会话变化返回 false。 */
+    private suspend fun refreshAccountLocked(token: String, accNum: String, expectedLoginToken: String): Boolean {
+        var sessionValid = true
         runCatching {
             val info = yktApi.call("/GetAccInfo", mapOf("AccNum" to accNum), etToken = token)
-            authStore.saveYktAccount(
+            sessionValid = authStore.saveYktAccount(
                 epid = info.field("EPID").orEmpty(),
                 cardAccNum = info.field("CardAccNum").orEmpty(),
                 accName = info.field("AccName").orEmpty(),
+                expectedLoginToken = expectedLoginToken,
             )
         }.onFailure { if (it is CancellationException) throw it }
+        return sessionValid
     }
 
     /**
@@ -295,7 +304,7 @@ class YktRepository(
             reloginTried = true
             val s = authStore.current()
             if (s.username.isEmpty()) return YktResult.Err("未登录", SyncFailReason.LOGIN)
-            val relogin = courseRepo.login(s.username, s.password)
+            val relogin = courseRepo.login(s.username, s.password, expectedSession = s)
             if (relogin is LoginResult.Success) {
                 // 重登成功：网络计数清零，重签 ST
                 networkAttempts = 0

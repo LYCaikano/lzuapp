@@ -10,16 +10,22 @@ import li.lyc.lzuapp.data.db.AppDatabase
 import li.lyc.lzuapp.data.db.CourseEntity
 import li.lyc.lzuapp.data.db.SemesterEntity
 import li.lyc.lzuapp.ui.schedule.sectionRange
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.async
 import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.Semaphore
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.sync.withPermit
-import kotlinx.coroutines.withTimeout
+import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeoutOrNull
 import java.util.UUID
+import java.util.concurrent.atomic.AtomicLong
 
 sealed interface LoginResult {
     data class Success(val userName: String, val college: String) : LoginResult
@@ -48,51 +54,139 @@ class CourseRepository(
 
     // ---------- 登录 ----------
 
-    /** 第一步：账号密码登录 */
-    suspend fun login(username: String, password: String): LoginResult {
-        val deviceId = ensureDeviceId()
-        authStore.saveCredentials(username, password, deviceId)
-        return api.login(username, password, deviceId).fold(
-            onSuccess = { data ->
-                if (data.loginToken != null && data.gatewayToken != null) {
-                    authStore.saveLoginResult(data.loginToken, data.gatewayToken)
-                    val info = fetchAndSaveUserInfo(data.loginToken, data.gatewayToken)
-                    LoginResult.Success(
-                        userName = info.first,
-                        college = info.second,
-                    )
-                } else {
-                    data.sessionId?.let { authStore.saveSessionId(it) }
-                    LoginResult.NeedCaptcha(data.sessionId.orEmpty())
-                }
-            },
-            onFailure = { e ->
-                Log.e("Kcb", "login failed", e)
-                // 登录错误详情落盘仅 debug 包（含堆栈/服务端报错，release 完全不写）
-                if (li.lyc.lzuapp.BuildConfig.DEBUG) runCatching {
-                    // 超过 64KB 截断重写，防止无限增长
-                    val f = context.getFileStreamPath("login_err.log")
-                    val mode = if (f != null && f.length() > 64 * 1024) Context.MODE_PRIVATE
-                    else Context.MODE_APPEND
-                    context.openFileOutput("login_err.log", mode).use {
-                        it.write(("${System.currentTimeMillis()} ${e::class.java.name}: ${e.message}\n").toByteArray())
-                        e.stackTraceToString().forEach { line ->
-                            it.write((line + "\n").toByteArray())
-                        }
-                    }
-                }
-                LoginResult.Failed(
-                    cleanMsg(e.message),
-                    if (e is java.io.IOException) SyncFailReason.NETWORK else SyncFailReason.OTHER,
-                )
-            },
+    private val authMutex = Mutex()
+    private val authGeneration = AtomicLong(0)
+
+    private fun sameAccountSession(expected: AuthStore.AuthState, current: AuthStore.AuthState): Boolean =
+        expected.username == current.username && expected.password == current.password &&
+            expected.deviceId == current.deviceId && expected.loginToken == current.loginToken &&
+            expected.gatewayToken == current.gatewayToken
+
+    private fun staleLoginResult() = LoginResult.Failed("登录操作已过期，请重试", SyncFailReason.LOGIN)
+
+    /** 第一步：账号密码登录。整个认证与最终快照提交在同一认证锁内完成。 */
+    suspend fun login(
+        username: String,
+        password: String,
+        expectedSession: AuthStore.AuthState? = null,
+    ): LoginResult {
+        val generation = authGeneration.get()
+        return authMutex.withLock {
+            if (generation != authGeneration.get()) return@withLock staleLoginResult()
+            if (expectedSession != null && !sameAccountSession(expectedSession, authStore.current())) {
+                return@withLock staleLoginResult()
+            }
+            loginLocked(username.trim(), password, generation, expectedSession)
+        }
+    }
+
+    private suspend fun loginLocked(
+        username: String,
+        password: String,
+        generation: Long,
+        expectedSession: AuthStore.AuthState?,
+    ): LoginResult {
+        val isInteractive = expectedSession == null
+        val deviceId = expectedSession?.deviceId?.ifEmpty { UUID.randomUUID().toString() } ?: ensureDeviceId()
+        // 只有交互登录需要预存凭据供短信完成步骤使用；静默登录成功时才原子提交完整快照。
+        if (isInteractive) authStore.saveCredentials(username, password, deviceId)
+        return authenticate(
+            username = username,
+            password = password,
+            deviceId = deviceId,
+            saveSessionOnChallenge = isInteractive,
+            generation = generation,
         )
     }
+
+    private suspend fun loginForRefresh(expected: AuthStore.AuthState): LoginResult =
+        login(expected.username, expected.password, expectedSession = expected)
+
+    /** 重新认证仅允许当前学号，成功前不覆盖已保存的密码或登录令牌。 */
+    suspend fun reauthenticate(username: String, password: String): LoginResult {
+        val generation = authGeneration.get()
+        return authMutex.withLock {
+            if (generation != authGeneration.get()) return@withLock staleLoginResult()
+            val current = authStore.current()
+            if (current.username.isBlank() || username.trim() != current.username) {
+                return@withLock LoginResult.Failed("重新认证仅支持当前学号，不能直接更换账号", SyncFailReason.LOGIN)
+            }
+            val deviceId = ensureDeviceId()
+            authenticate(
+                username = current.username,
+                password = password,
+                deviceId = deviceId,
+                saveSessionOnChallenge = false,
+                generation = generation,
+            )
+        }
+    }
+
+    private suspend fun authenticate(
+        username: String,
+        password: String,
+        deviceId: String,
+        saveSessionOnChallenge: Boolean,
+        generation: Long,
+    ): LoginResult = api.login(username, password, deviceId).fold(
+        onSuccess = { data ->
+            if (!data.loginToken.isNullOrEmpty() && !data.gatewayToken.isNullOrEmpty()) {
+                completeLogin(
+                    username = username,
+                    password = password,
+                    deviceId = deviceId,
+                    loginToken = data.loginToken,
+                    gatewayToken = data.gatewayToken,
+                    generation = generation,
+                )
+            } else {
+                val sessionId = data.sessionId.orEmpty()
+                if (sessionId.isBlank()) {
+                    LoginResult.Failed("登录服务未返回短信验证会话，请稍后重试", SyncFailReason.LOGIN)
+                } else {
+                    if (generation != authGeneration.get()) return@fold staleLoginResult()
+                    if (saveSessionOnChallenge) authStore.saveSessionId(sessionId)
+                    LoginResult.NeedCaptcha(sessionId)
+                }
+            }
+        },
+        onFailure = { e ->
+            if (e is CancellationException) throw e
+            Log.e("Kcb", "login failed", e)
+            // 登录错误详情落盘仅 debug 包（含堆栈/服务端报错，release 完全不写）
+            if (li.lyc.lzuapp.BuildConfig.DEBUG) runCatching {
+                // 超过 64KB 截断重写，防止无限增长
+                val f = context.getFileStreamPath("login_err.log")
+                val mode = if (f != null && f.length() > 64 * 1024) Context.MODE_PRIVATE
+                else Context.MODE_APPEND
+                context.openFileOutput("login_err.log", mode).use {
+                    it.write(("${System.currentTimeMillis()} ${e::class.java.name}: ${e.message}\n").toByteArray())
+                    e.stackTraceToString().forEach { line ->
+                        it.write((line + "\n").toByteArray())
+                    }
+                }
+            }
+            LoginResult.Failed(
+                cleanMsg(e.message),
+                if (e is java.io.IOException) SyncFailReason.NETWORK else SyncFailReason.OTHER,
+            )
+        },
+    )
 
     /** 第二步：发送验证码 */
     suspend fun sendCaptcha(): Boolean {
         val s = authStore.current()
+        if (s.sessionId.isBlank()) return false
         return api.sendPhoneCaptcha(s.deviceId, s.sessionId).fold(
+            onSuccess = { it.code == 1 },
+            onFailure = { false },
+        )
+    }
+
+    suspend fun sendReauthenticationCaptcha(sessionId: String): Boolean {
+        if (sessionId.isBlank()) return false
+        val s = authStore.current()
+        return api.sendPhoneCaptcha(s.deviceId, sessionId).fold(
             onSuccess = { it.code == 1 },
             onFailure = { false },
         )
@@ -100,47 +194,137 @@ class CourseRepository(
 
     /** 第三步：提交验证码完成登录 */
     suspend fun verifyCaptcha(captcha: String): LoginResult {
-        val s = authStore.current()
-        return api.verifyPhoneCaptcha(s.deviceId, s.sessionId, captcha).fold(
-            onSuccess = { data ->
-                if (data.loginToken != null && data.gatewayToken != null) {
-                    authStore.saveLoginResult(data.loginToken, data.gatewayToken)
-                    val info = fetchAndSaveUserInfo(data.loginToken, data.gatewayToken)
-                    LoginResult.Success(
-                        userName = info.first,
-                        college = info.second,
+        val generation = authGeneration.get()
+        return authMutex.withLock {
+            if (generation != authGeneration.get()) return@withLock staleLoginResult()
+            val s = authStore.current()
+            if (s.sessionId.isBlank()) {
+                return@withLock LoginResult.Failed("短信验证会话已失效，请重新登录", SyncFailReason.LOGIN)
+            }
+            api.verifyPhoneCaptcha(s.deviceId, s.sessionId, captcha).fold(
+                onSuccess = { data ->
+                    if (!data.loginToken.isNullOrEmpty() && !data.gatewayToken.isNullOrEmpty()) {
+                        completeLogin(
+                            username = s.username,
+                            password = s.password,
+                            deviceId = s.deviceId,
+                            loginToken = data.loginToken,
+                            gatewayToken = data.gatewayToken,
+                            generation = generation,
+                        )
+                    } else LoginResult.Failed("验证码验证失败")
+                },
+                onFailure = {
+                    if (it is CancellationException) throw it
+                    LoginResult.Failed(
+                        cleanMsg(it.message),
+                        if (it is java.io.IOException) SyncFailReason.NETWORK else SyncFailReason.OTHER,
                     )
-                } else LoginResult.Failed("验证码验证失败")
-            },
-            onFailure = { LoginResult.Failed(
-                cleanMsg(it.message),
-                if (it is java.io.IOException) SyncFailReason.NETWORK else SyncFailReason.OTHER,
-            ) },
+                },
+            )
+        }
+    }
+
+    suspend fun verifyReauthentication(
+        username: String,
+        password: String,
+        sessionId: String,
+        captcha: String,
+    ): LoginResult {
+        val generation = authGeneration.get()
+        return authMutex.withLock {
+            if (generation != authGeneration.get()) return@withLock staleLoginResult()
+            val current = authStore.current()
+            if (current.username.isBlank() || username.trim() != current.username) {
+                return@withLock LoginResult.Failed("重新认证仅支持当前学号，不能直接更换账号", SyncFailReason.LOGIN)
+            }
+            if (sessionId.isBlank()) {
+                return@withLock LoginResult.Failed("短信验证会话已失效，请重新认证", SyncFailReason.LOGIN)
+            }
+            val deviceId = ensureDeviceId()
+            api.verifyPhoneCaptcha(deviceId, sessionId, captcha).fold(
+                onSuccess = { data ->
+                    if (!data.loginToken.isNullOrEmpty() && !data.gatewayToken.isNullOrEmpty()) {
+                        completeLogin(
+                            username = current.username,
+                            password = password,
+                            deviceId = deviceId,
+                            loginToken = data.loginToken,
+                            gatewayToken = data.gatewayToken,
+                            generation = generation,
+                        )
+                    } else LoginResult.Failed("验证码验证失败")
+                },
+                onFailure = {
+                    if (it is CancellationException) throw it
+                    LoginResult.Failed(
+                        cleanMsg(it.message),
+                        if (it is java.io.IOException) SyncFailReason.NETWORK else SyncFailReason.OTHER,
+                    )
+                },
+            )
+        }
+    }
+
+    private suspend fun completeLogin(
+        username: String,
+        password: String,
+        deviceId: String,
+        loginToken: String,
+        gatewayToken: String,
+        generation: Long,
+    ): LoginResult {
+        val info = fetchUserInfo(loginToken, gatewayToken)
+        if (generation != authGeneration.get()) return staleLoginResult()
+        currentCoroutineContext().ensureActive()
+        authStore.saveAuthenticatedSnapshot(
+            username = username,
+            password = password,
+            deviceId = deviceId,
+            loginToken = loginToken,
+            gatewayToken = gatewayToken,
+            userInfo = info,
+        )
+        return LoginResult.Success(userName = info?.userName.orEmpty(), college = info?.college.orEmpty())
+    }
+
+    /** 拉取用户信息，最多等 8s；失败不阻塞登录，父协程取消继续向上传递。 */
+    private suspend fun fetchUserInfo(
+        loginToken: String,
+        gatewayToken: String,
+    ): AuthStore.UserInfoSnapshot? {
+        val result = try {
+            withTimeoutOrNull(8_000) { api.userInfo(loginToken, gatewayToken) }
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            Log.w("Kcb", "fetch user info failed", e)
+            null
+        }
+        val u = result?.getOrElse {
+            if (it is CancellationException) throw it
+            null
+        } ?: return null
+        fun str(key: String): String =
+            (u[key] as? kotlinx.serialization.json.JsonPrimitive)?.content.orEmpty()
+        return AuthStore.UserInfoSnapshot(
+            userName = str("xm"),
+            college = str("dwmc"),
+            xykh = str("xykh"),
         )
     }
 
-    /** 拉取用户信息并写入 DataStore，返回 (姓名, 学院)。最多等 8s，失败不阻塞登录。 */
-    private suspend fun fetchAndSaveUserInfo(loginToken: String, gatewayToken: String): Pair<String, String> {
-        val u = runCatching {
-            withTimeout(8_000) { api.userInfo(loginToken, gatewayToken) }
-        }.getOrNull()?.getOrNull() ?: return "" to ""
-        fun str(key: String): String =
-            (u[key] as? kotlinx.serialization.json.JsonPrimitive)?.content.orEmpty()
-        val name = str("xm")
-        val college = str("dwmc")
-        val xykh = str("xykh")
-        authStore.saveUserInfo(userName = name, college = college, xykh = xykh)
-        return name to college
-    }
-
-    /**
-     * 用当前登录态补拉用户信息（自愈：登录时被服务端风控挡住后，
-     * 下次打开 App 静默刷新时补上姓名/学院）。
-     */
+    /** 用当前登录态补拉用户信息；与认证、退出串行，避免旧信息在退出后落盘。 */
     suspend fun refreshUserInfo() {
-        val s = authStore.current()
-        if (!s.isLoggedIn || s.loginToken.isEmpty() || s.gatewayToken.isEmpty()) return
-        runCatching { fetchAndSaveUserInfo(s.loginToken, s.gatewayToken) }
+        val generation = authGeneration.get()
+        authMutex.withLock {
+            if (generation != authGeneration.get()) return@withLock
+            val s = authStore.current()
+            if (!s.isLoggedIn) return@withLock
+            val info = fetchUserInfo(s.loginToken, s.gatewayToken) ?: return@withLock
+            if (generation != authGeneration.get()) return@withLock
+            authStore.saveUserInfo(info.userName, info.college, info.xykh)
+        }
     }
 
     private suspend fun ensureDeviceId(): String {
@@ -216,6 +400,14 @@ class CourseRepository(
      * 2) loginToken 失效（非网络错误）才走 loginV2 完整重登录；
      * 网络错误直接失败（重登录同样打不通，白耗一次风控额度）。
      */
+    private suspend fun saveAccessTokenIfCurrent(expected: AuthStore.AuthState, accessToken: String): Boolean =
+        authMutex.withLock {
+            val current = authStore.current()
+            if (!sameAccountSession(expected, current)) return@withLock false
+            authStore.saveAccessToken(accessToken)
+            true
+        }
+
     private suspend fun refreshAccessTokenLocked(): Result<String> {
         val s = authStore.current()
         if (s.loginToken.isNotEmpty() && s.gatewayToken.isNotEmpty()) {
@@ -227,13 +419,13 @@ class CourseRepository(
                     val st = api.getSt(s.loginToken, s.gatewayToken).getOrThrow()
                     api.accessTokenBySt(st).getOrThrow().accessToken.orEmpty()
                 }
-                light.onSuccess {
-                    if (it.isNotEmpty()) {
-                        authStore.saveAccessToken(it)
-                        return Result.success(it)
-                    }
+                val accessToken = light.getOrNull()
+                if (!accessToken.isNullOrEmpty()) {
+                    if (saveAccessTokenIfCurrent(s, accessToken)) return Result.success(accessToken)
+                    return Result.failure(Exception("登录状态已变化"))
                 }
                 val e = light.exceptionOrNull() ?: continue
+                if (e is CancellationException) throw e
                 lastErr = e
                 if (e !is java.io.IOException) {
                     authDead = true // 服务端明确拒绝（如 10004），重试无意义
@@ -241,9 +433,9 @@ class CourseRepository(
                 }
                 if (attempt < 2) kotlinx.coroutines.delay(800) // 网络抖动稍候重试
             }
-            if (!authDead && lastErr != null) return Result.failure(lastErr!!)
+            if (!authDead && lastErr != null) return Result.failure(lastErr)
         }
-        val relogin = login(s.username, s.password)
+        val relogin = loginForRefresh(s)
         if (relogin !is LoginResult.Success) {
             return Result.failure(
                 if (relogin is LoginResult.Failed && relogin.reason == SyncFailReason.NETWORK)
@@ -254,8 +446,12 @@ class CourseRepository(
         val cur = authStore.current()
         val st = api.getSt(cur.loginToken, cur.gatewayToken).getOrElse { return Result.failure(it) }
         val at = api.accessTokenBySt(st).getOrElse { return Result.failure(it) }
-        authStore.saveAccessToken(at.accessToken.orEmpty())
-        return Result.success(at.accessToken.orEmpty())
+        val accessToken = at.accessToken.orEmpty()
+        if (accessToken.isEmpty()) return Result.failure(Exception("未获取到 access_token"))
+        if (!saveAccessTokenIfCurrent(cur, accessToken)) {
+            return Result.failure(Exception("登录状态已变化"))
+        }
+        return Result.success(accessToken)
     }
 
     /**
@@ -318,7 +514,6 @@ class CourseRepository(
         val first = runCatching { syncCourses(token) }
         if (first.isSuccess) {
             refreshUserInfo()
-            authStore.touchSync()
             return SyncResult.Success
         }
         val e = first.exceptionOrNull()!!
@@ -332,7 +527,6 @@ class CourseRepository(
         }
         return if (retry.isSuccess) {
             refreshUserInfo()
-            authStore.touchSync()
             SyncResult.Success
         } else {
             val e2 = retry.exceptionOrNull()!!
@@ -352,9 +546,9 @@ class CourseRepository(
     suspend fun refreshLoginState(): SyncResult {
         val s = authStore.current()
         if (s.username.isEmpty()) return SyncResult.Failed("未登录", SyncFailReason.LOGIN)
-        return when (val r = login(s.username, s.password)) {
+        return when (val r = loginForRefresh(s)) {
             is LoginResult.Success -> SyncResult.Success
-            is LoginResult.NeedCaptcha -> SyncResult.Failed("需要短信验证，请退出后重新登录", SyncFailReason.LOGIN)
+            is LoginResult.NeedCaptcha -> SyncResult.Failed("需要短信验证，请重新输入密码完成认证", SyncFailReason.LOGIN)
             is LoginResult.Failed -> SyncResult.Failed(r.message, r.reason)
         }
     }
@@ -367,25 +561,8 @@ class CourseRepository(
      * - 自定义课：`getKcXxByKcmc`（真实 kch / color / create_user_id）。
      */
     private suspend fun syncCourses(token: String) {
+        val generation = authGeneration.get()
         val xlxx = api.getXlxx(token).getOrElse { null }
-        if (xlxx != null) {
-            db.semesterDao().upsert(
-                SemesterEntity(
-                    xn = xlxx.xn,
-                    xqm = xlxx.xqm,
-                    xq = xlxx.xq,
-                    currentWeek = xlxx.dqrqszzc?.toIntOrNull() ?: 1,
-                    totalWeeks = xlxx.zzs?.toIntOrNull() ?: 20,
-                    semesterStart = xlxx.ksrq,
-                )
-            )
-        }
-        // 缺学期信息的历史本地自定义课补到当前学期
-        val semXn = xlxx?.xn
-        val semXqm = xlxx?.xqm?.toIntOrNull()
-        if (!semXn.isNullOrEmpty() && semXqm != null) {
-            db.courseDao().backfillCustomSemester(semXn, semXqm)
-        }
 
         // 自定义课（真实 kch/颜色/创建人）
         val customRemote = api.getCourses(token).getOrThrow()
@@ -393,8 +570,7 @@ class CourseRepository(
         // 正式课：逐周拉取（服务端无全量接口）。限流并发 4——串行 20+ 次请求在弱网下
         // 会逼近 access_token 的 120s 寿命红线；任一周失败整轮抛错走自愈，
         // 绝不用半拉子数据覆盖本地缓存。
-        val totalWeeks = xlxx?.zzs?.toIntOrNull()
-            ?: db.semesterDao().get()?.totalWeeks ?: 20
+        val totalWeeks = xlxx?.zzs?.toIntOrNull() ?: 20
         val officialByKey = java.util.concurrent.ConcurrentHashMap<String, CourseData>()
         coroutineScope {
             val permits = Semaphore(4)
@@ -415,72 +591,98 @@ class CourseRepository(
             throw ApiException("课表数据异常（空响应），已保留本地缓存")
         }
 
-        val customLocal = db.courseDao().getCustomCourses().associateBy { it.kch }
-        val myNo = authStore.current().username
+        // 网络阶段不持认证锁；所有本地读写和同步时间只在会话仍有效时提交。
+        authMutex.withLock {
+            if (generation != authGeneration.get()) return@withLock
+            val current = authStore.current()
+            if (generation != authGeneration.get() || !current.isLoggedIn) return@withLock
 
-        val officialEntities = officialByKey.values.map { c ->
-            CourseEntity(
-                // 正式课 kch 服务端不具备唯一性（多为 "0"）：内容哈希做主键，跨同步稳定
-                kch = "off_" + md5(officialKey(c)),
-                kcmc = c.kcmc.orEmpty(),
-                jsxm = c.jsxm,
-                jc = c.jc ?: "00000000000000",
-                skjsl = c.skjsl,
-                skxql = c.skxql?.toIntOrNull() ?: 1,
-                week = normalizeWeek(c.week),
-                bs = c.bs ?: "1",
-                xykh = c.xykh,
-                xn = c.xn,
-                xqm = c.xqm,
-                status = c.status ?: 1,
-                color = c.color,
-                skjc = c.skjc,
-                xf = c.xf,
-                weekFb = c.weekFb,
-                // kcrq 是"该周具体上课日期"（每次课一条），不是补课标记——必须置空，
-                // 否则会被 inWeek() 当成单次补课课处理
-                kcrq = null,
-                createUserId = null,
-                isCustom = false,
-            )
+            if (xlxx != null) {
+                db.semesterDao().upsert(
+                    SemesterEntity(
+                        xn = xlxx.xn,
+                        xqm = xlxx.xqm,
+                        xq = xlxx.xq,
+                        currentWeek = xlxx.dqrqszzc?.toIntOrNull() ?: 1,
+                        totalWeeks = xlxx.zzs?.toIntOrNull() ?: 20,
+                        semesterStart = xlxx.ksrq,
+                    )
+                )
+            }
+            // 缺学期信息的历史本地自定义课补到当前学期
+            val semXn = xlxx?.xn
+            val semXqm = xlxx?.xqm?.toIntOrNull()
+            if (!semXn.isNullOrEmpty() && semXqm != null) {
+                db.courseDao().backfillCustomSemester(semXn, semXqm)
+            }
+
+            val customLocal = db.courseDao().getCustomCourses().associateBy { it.kch }
+            val myNo = current.username
+            val officialEntities = officialByKey.values.map { c ->
+                CourseEntity(
+                    // 正式课 kch 服务端不具备唯一性（多为 "0"）：内容哈希做主键，跨同步稳定
+                    kch = "off_" + md5(officialKey(c)),
+                    kcmc = c.kcmc.orEmpty(),
+                    jsxm = c.jsxm,
+                    jc = c.jc ?: "00000000000000",
+                    skjsl = c.skjsl,
+                    skxql = c.skxql?.toIntOrNull() ?: 1,
+                    week = normalizeWeek(c.week),
+                    bs = c.bs ?: "1",
+                    xykh = c.xykh,
+                    xn = c.xn,
+                    xqm = c.xqm,
+                    status = c.status ?: 1,
+                    color = c.color,
+                    skjc = c.skjc,
+                    xf = c.xf,
+                    weekFb = c.weekFb,
+                    // kcrq 是"该周具体上课日期"（每次课一条），不是补课标记——必须置空，
+                    // 否则会被 inWeek() 当成单次补课课处理
+                    kcrq = null,
+                    createUserId = null,
+                    isCustom = false,
+                )
+            }
+            val customEntities = customRemote.map { c ->
+                CourseEntity(
+                    kch = c.kch ?: UUID.randomUUID().toString(),
+                    kcmc = c.kcmc.orEmpty(),
+                    jsxm = c.jsxm,
+                    jc = c.jc ?: "00000000000000",
+                    skjsl = c.skjsl,
+                    skxql = c.skxql?.toIntOrNull() ?: 1,
+                    week = c.week.orEmpty(),
+                    bs = c.bs ?: "1",
+                    xykh = c.xykh,
+                    xn = c.xn,
+                    xqm = c.xqm,
+                    status = c.status ?: 1,
+                    color = c.color,
+                    skjc = c.skjc,
+                    xf = c.xf,
+                    weekFb = c.weekFb,
+                    kcrq = c.kcrq,
+                    // 服务端自定义课：创建人 = 当前学号（官方 App 添加的课本端可编辑/删除）
+                    createUserId = c.createUserId,
+                    isCustom = customLocal.containsKey(c.kch) || (c.createUserId != null && c.createUserId == myNo),
+                )
+            }
+            val entities = officialEntities + customEntities
+            db.courseDao().upsertAll(entities)
+            // 移除服务端已不存在的同步课程（保留本地自定义）
+            val syncedIds = entities.map { it.kch }.toSet()
+            db.courseDao().getAll().filter { !it.isCustom && it.kch !in syncedIds }
+                .forEach { db.courseDao().deleteByKch(it.kch) }
+            // 本地补传成功的课程（local* 副本）与云端自定义课重复：以云端为准清理（同学期内比较）。
+            // 只跟云端自定义课比（正式课与自定义课同名同时段属巧合，不能误删）
+            val remoteKeys = customEntities.map { CourseKey(it.kcmc, it.skxql, it.jc, it.xn, it.xqm) }.toSet()
+            db.courseDao().getAll().filter {
+                it.isCustom && it.kch.startsWith("local") &&
+                    CourseKey(it.kcmc, it.skxql, it.jc, it.xn, it.xqm) in remoteKeys
+            }.forEach { db.courseDao().deleteByKch(it.kch) }
+            authStore.touchSync()
         }
-        val customEntities = customRemote.map { c ->
-            CourseEntity(
-                kch = c.kch ?: UUID.randomUUID().toString(),
-                kcmc = c.kcmc.orEmpty(),
-                jsxm = c.jsxm,
-                jc = c.jc ?: "00000000000000",
-                skjsl = c.skjsl,
-                skxql = c.skxql?.toIntOrNull() ?: 1,
-                week = c.week.orEmpty(),
-                bs = c.bs ?: "1",
-                xykh = c.xykh,
-                xn = c.xn,
-                xqm = c.xqm,
-                status = c.status ?: 1,
-                color = c.color,
-                skjc = c.skjc,
-                xf = c.xf,
-                weekFb = c.weekFb,
-                kcrq = c.kcrq,
-                // 服务端自定义课：创建人 = 当前学号（官方 App 添加的课本端可编辑/删除）
-                createUserId = c.createUserId,
-                isCustom = customLocal.containsKey(c.kch) || (c.createUserId != null && c.createUserId == myNo),
-            )
-        }
-        val entities = officialEntities + customEntities
-        db.courseDao().upsertAll(entities)
-        // 移除服务端已不存在的同步课程（保留本地自定义）
-        val syncedIds = entities.map { it.kch }.toSet()
-        db.courseDao().getAll().filter { !it.isCustom && it.kch !in syncedIds }
-            .forEach { db.courseDao().deleteByKch(it.kch) }
-        // 本地补传成功的课程（local* 副本）与云端自定义课重复：以云端为准清理（同学期内比较）。
-        // 只跟云端自定义课比（正式课与自定义课同名同时段属巧合，不能误删）
-        val remoteKeys = customEntities.map { CourseKey(it.kcmc, it.skxql, it.jc, it.xn, it.xqm) }.toSet()
-        db.courseDao().getAll().filter {
-            it.isCustom && it.kch.startsWith("local") &&
-                CourseKey(it.kcmc, it.skxql, it.jc, it.xn, it.xqm) in remoteKeys
-        }.forEach { db.courseDao().deleteByKch(it.kch) }
     }
 
     /** 正式课内容去重键（kcrq 每次课不同，不参与；week 归一化后参与） */
@@ -665,10 +867,24 @@ class CourseRepository(
     }
 
     suspend fun logout() {
-        authStore.logout()
-        // 清空全部课程与校历（含服务端自定义课，防止换账号残留）
-        db.courseDao().deleteAll()
-        db.semesterDao().clear()
+        // 先使所有尚未提交及排队中的认证失效，再等待在途认证退出认证锁。
+        authGeneration.incrementAndGet()
+        withContext(NonCancellable) {
+            authMutex.withLock {
+                try {
+                    authStore.clearAccountData()
+                    db.courseDao().deleteAll()
+                    db.semesterDao().clear()
+                } finally {
+                    try {
+                        li.lyc.lzuapp.net.NetAutoLogin.syncState(context, false)
+                    } finally {
+                        // 课程、个人数据和网络回调清理后，最后撤销驱动 UI 切换的登录态。
+                        authStore.clearLoginState()
+                    }
+                }
+            }
+        }
     }
 
     private fun CourseEntity.toApiModel() = CourseData(

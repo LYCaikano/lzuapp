@@ -33,26 +33,54 @@ class LoginViewModel(private val repo: CourseRepository) : ViewModel() {
     private val _uiState = MutableStateFlow(LoginUiState())
     val uiState: StateFlow<LoginUiState> = _uiState.asStateFlow()
 
+    private var requestJob: Job? = null
+    private var cooldownJob: Job? = null
+    private var requestGeneration = 0L
+    private var captchaSendInFlight = false
+
+    private fun invalidateRequest(): Boolean {
+        val wasSendingCaptcha = captchaSendInFlight
+        captchaSendInFlight = false
+        requestGeneration++
+        requestJob?.cancel()
+        return wasSendingCaptcha
+    }
+
+    private fun beginRequest(): Long {
+        invalidateRequest()
+        return requestGeneration
+    }
+
     // 学号/密码变更后旧的验证码会话（sessionId）已失效，需清掉二次认证状态回到账号密码登录
     fun onUsernameChange(v: String) {
+        invalidateRequest()
+        cooldownJob?.cancel()
         _uiState.value = _uiState.value.copy(
-            username = v, error = null, needCaptcha = false, captcha = "", captchaSent = false
+            username = v, loading = false, error = null, needCaptcha = false,
+            captcha = "", captchaSent = false, captchaCooldown = 0,
         )
     }
 
     fun onPasswordChange(v: String) {
+        invalidateRequest()
+        cooldownJob?.cancel()
         _uiState.value = _uiState.value.copy(
-            password = v, error = null, needCaptcha = false, captcha = "", captchaSent = false
+            password = v, loading = false, error = null, needCaptcha = false,
+            captcha = "", captchaSent = false, captchaCooldown = 0,
         )
     }
 
     fun onCaptchaChange(v: String) {
-        _uiState.value = _uiState.value.copy(captcha = v, error = null)
+        val resetCooldown = invalidateRequest()
+        _uiState.value = _uiState.value.copy(
+            captcha = v, loading = false, error = null,
+            captchaCooldown = if (resetCooldown) 0 else _uiState.value.captchaCooldown,
+        )
     }
 
     /** 重置表单（退出登录后再次进入登录页时清理残留状态） */
     fun reset() {
-        // 取消可能仍在跑的冷却倒计时，避免旧协程往新状态写值
+        invalidateRequest()
         cooldownJob?.cancel()
         _uiState.value = LoginUiState()
     }
@@ -71,10 +99,16 @@ class LoginViewModel(private val repo: CourseRepository) : ViewModel() {
             _uiState.value = s.copy(error = "请输入验证码")
             return
         }
-        _uiState.value = s.copy(loading = true, error = null)
-        viewModelScope.launch {
+        val resetCooldown = captchaSendInFlight
+        val generation = beginRequest()
+        _uiState.value = s.copy(
+            loading = true, error = null,
+            captchaCooldown = if (resetCooldown) 0 else s.captchaCooldown,
+        )
+        requestJob = viewModelScope.launch {
             val result = if (s.needCaptcha) repo.verifyCaptcha(s.captcha.trim())
             else repo.login(s.username.trim(), s.password)
+            if (generation != requestGeneration) return@launch
             when (result) {
                 is LoginResult.Success -> _uiState.value = _uiState.value.copy(loading = false)
                 is LoginResult.NeedCaptcha -> _uiState.value = _uiState.value.copy(
@@ -87,12 +121,15 @@ class LoginViewModel(private val repo: CourseRepository) : ViewModel() {
         }
     }
 
-    private var cooldownJob: Job? = null
-
     fun sendCaptcha() {
+        val generation = beginRequest()
+        cooldownJob?.cancel()
         _uiState.value = _uiState.value.copy(captchaCooldown = 90)
-        viewModelScope.launch {
+        captchaSendInFlight = true
+        requestJob = viewModelScope.launch {
             val ok = repo.sendCaptcha()
+            if (generation != requestGeneration) return@launch
+            captchaSendInFlight = false
             if (ok) {
                 _uiState.value = _uiState.value.copy(captchaSent = true, error = null)
                 startCooldown()
